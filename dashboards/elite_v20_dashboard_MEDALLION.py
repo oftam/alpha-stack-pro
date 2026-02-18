@@ -218,9 +218,18 @@ def start_sentinel_daemon():
             
             while True:
                 try:
-                    # 1. Quiet Data Fetch
-                    exchange = ccxt.binance()
-                    ohlcv = exchange.fetch_ohlcv('BTCUSDT', '1h', limit=100)
+                    # 1. Quiet Data Fetch (multi-exchange fallback)
+                    for ex_name in ['bybit', 'kraken', 'okx', 'binance']:
+                        try:
+                            exchange = getattr(ccxt, ex_name)()
+                            ohlcv = exchange.fetch_ohlcv('BTC/USDT', '1h', limit=100)
+                            break
+                        except Exception:
+                            continue
+                    else:
+                        print("⚠️ Sentinel: All exchanges failed")
+                        time.sleep(900)
+                        continue
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     df.set_index('timestamp', inplace=True)
@@ -244,7 +253,7 @@ def start_sentinel_daemon():
                         'dna': round(manifold_score, 1),
                         'div_label': "BULLISH" if diffusion_score > 60 else "BEARISH" if diffusion_score < 40 else "NEUTRAL",
                         'div_score': round(diffusion_score, 1),
-                        'sentiment': 50, # Placeholder or fetch if possible
+                        'sentiment': 50,
                         'sent_label': "Neutral",
                         'strategy_hint': f"Regime: {results.get('chaos', {}).get('regime', 'NORMAL')}"
                     }
@@ -258,10 +267,10 @@ def start_sentinel_daemon():
                         print(f"🛡️ Sentinel: Action changed {last_action} -> {current_action}")
                     
                     # B. Critical Events
-                    if manifold_score >= 82: # Victory Vector
+                    if manifold_score >= 82:
                         should_alert = True
                     
-                    if diffusion_score >= 80 or diffusion_score <= 20: # Extreme Divergence
+                    if diffusion_score >= 80 or diffusion_score <= 20:
                         should_alert = True
                         
                     # Send Alert
@@ -290,19 +299,34 @@ def start_sentinel_daemon():
 # ============================================================================
 
 @st.cache_data(ttl=300)
-def fetch_binance_data(symbol: str, interval: str, limit: int = 500):
-    """Fetch OHLCV from Binance"""
+def fetch_crypto_data(symbol: str, interval: str, limit: int = 500):
+    """Fetch OHLCV with multi-exchange fallback (Binance may be geo-blocked)"""
     import ccxt
-    try:
-        exchange = ccxt.binance()
-        ohlcv = exchange.fetch_ohlcv(symbol, interval, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        return df
-    except Exception as e:
-        st.error(f"Data fetch error: {e}")
-        return pd.DataFrame()
+    
+    # Map symbols: BTCUSDT → BTC/USDT for non-Binance exchanges
+    normalized = symbol.replace('USDT', '/USDT').replace('BUSD', '/BUSD') if '/' not in symbol else symbol
+    
+    exchanges = ['bybit', 'binance', 'kraken', 'okx']
+    
+    for ex_name in exchanges:
+        try:
+            exchange = getattr(ccxt, ex_name)()
+            sym = symbol if ex_name == 'binance' else normalized
+            ohlcv = exchange.fetch_ohlcv(sym, interval, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            print(f"✅ Data from {ex_name}")
+            return df
+        except Exception as e:
+            print(f"⚠️ {ex_name} failed: {e}")
+            continue
+    
+    st.error("All exchanges failed! Check your internet connection.")
+    return pd.DataFrame()
+
+# Keep old name as alias for compatibility
+fetch_binance_data = fetch_crypto_data
 
 @st.cache_data(ttl=600)
 def fetch_fear_greed():
@@ -389,7 +413,7 @@ def main():
     # ========================================================================
     
     with st.spinner("🌀 Connecting to Quantum Field..."):
-        df = fetch_binance_data(symbol, interval)
+        df = fetch_crypto_data(symbol, interval)
         fear_greed = fetch_fear_greed()
         
         if df.empty:
