@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Quant War Room ML PRO — ONEFILE (v8)
+
+Wraps v7 engine and adds QC layers:
+
+🫧 Diffusion (Flow)
+- Uses orderbook imbalance (Binance depth snapshot)
+- Uses accumulation/distribution proxy from OHLCV (volume shock + close location)
+- If diffusion_module_FIXED.py is present, we also try to run its analyzer
+  (may require external keys for some components; it will degrade gracefully).
+
+🧬 Structure (Correlation network lite)
+- Fetches a small basket (ETH/SOL/BNB) with same interval/bars
+- Computes rolling return correlations vs BTC
+- Derives:
+  - coherence: mean(abs(corr))
+  - corr_break: short_term_corr - long_term_corr
+
+Policy integration
+- QC is *bias*, never a hard gate.
+- It only nudges Reduce aggressiveness and logs reason_codes.
+
+This file is safe to import from Streamlit via spec_from_file_location.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+import importlib.util
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+
+# -----------------------------------------------------------------------------
+# Load base (v7) engine
+# -----------------------------------------------------------------------------
+
+def _load_base_engine():
+    here = Path(__file__).resolve().parent
+    base_path = here / "quant_war_room_ml_pro_ONEFILE_v7_spot_eventbias.py"
+    if not base_path.exists():
+        raise FileNotFoundError(f"Base engine not found: {base_path}")
+    spec = importlib.util.spec_from_file_location("qwr_engine_v7", str(base_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load base engine module from {base_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+BASE = _load_base_engine()
+
+# Re-export commonly used constants/objects
+EXEC_SPOT = BASE.EXEC_SPOT
+EXEC_FUTURES = BASE.EXEC_FUTURES
+CORE_FLOOR = getattr(BASE, "CORE_FLOOR", 0.15)
+REDUCE_LEVELS = getattr(BASE, "REDUCE_LEVELS", [0.20, 0.35, 0.50])
+DEFAULT_TARGET_EXPOSURE = getattr(BASE, "DEFAULT_TARGET_EXPOSURE", 0.195)
+PSI_WARN = getattr(BASE, "PSI_WARN", 0.25)
+PSI_HIGH = getattr(BASE, "PSI_HIGH", 0.50)
+
+# Re-export data/model functions
+FEATURE_COLS = BASE.FEATURE_COLS
+build_features = BASE.build_features
+forward_return_label = BASE.forward_return_label
+quality_gates = BASE.quality_gates
+compute_regime = BASE.compute_regime
+make_dataset = BASE.make_dataset
+fit_model_on_dataset = BASE.fit_model_on_dataset
+train_calibrated_model = BASE.train_calibrated_model
+fit_model_on_dataset = BASE.fit_model_on_dataset
+fetch_rss_items = getattr(BASE, "fetch_rss_items", None)
+score_event_bias = getattr(BASE, "score_event_bias", None)
+EVENT_SOURCES_DEFAULT = getattr(BASE, "EVENT_SOURCES_DEFAULT", [])
+
+Decision = BASE.Decision
+IsoCalibratedWrapper = BASE.IsoCalibratedWrapper
+
+# -----------------------------------------------------------------------------
+# Binance helpers
+# -----------------------------------------------------------------------------
+
+def fetch_binance_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
+    url = "https://api.binance.com/api/v3/klines"
+    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": int(limit)}, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    cols = ["open_time", "Open", "High", "Low", "Close", "Volume",
+            "close_time", "qv", "ntr", "tbbav", "tbqav", "ignore"]
+    df = pd.DataFrame(data, columns=cols)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.set_index("open_time").sort_index()
+    return df
+
+
+def fetch_orderbook_imbalance(symbol: str, limit: int = 200) -> Tuple[float, Dict[str, float]]:
+    """Returns imbalance in [-1,+1]. +1 = bids dominate."""
+    url = "https://api.binance.com/api/v3/depth"
+    r = requests.get(url, params={"symbol": symbol, "limit": int(limit)}, timeout=10)
+    r.raise_for_status()
+    ob = r.json()
+    bids = ob.get("bids", [])
+    asks = ob.get("asks", [])
+
+    def _sum_side(side):
+        s = 0.0
+        for px, qty in side:
+            try:
+                s += float(px) * float(qty)
+            except Exception:
+                continue
+        return s
+
+    bid_val = _sum_side(bids)
+    ask_val = _sum_side(asks)
+    denom = bid_val + ask_val
+    imb = 0.0 if denom <= 0 else (bid_val - ask_val) / denom
+    return float(np.clip(imb, -1, 1)), {"bid_val": bid_val, "ask_val": ask_val}
+
+
+# -----------------------------------------------------------------------------
+# QC Flow (Diffusion) — robust proxies
+# -----------------------------------------------------------------------------
+
+def flow_proxy_from_ohlcv(df: pd.DataFrame, win: int = 50) -> Dict[str, float]:
+    """Pure OHLCV proxy:
+    - vol_z: volume zscore
+    - clv: close location value in [0,1]
+    - flow_proxy: in [-1,+1] where + means accumulation signature
+    """
+    d = df.copy()
+    rng = (d["High"] - d["Low"]).replace(0, np.nan)
+    clv = ((d["Close"] - d["Low"]) / rng).clip(0, 1)
+    vol = d["Volume"].astype(float)
+    m = vol.rolling(win).mean()
+    s = vol.rolling(win).std(ddof=0).replace(0, np.nan)
+    vol_z = ((vol - m) / s).replace([np.inf, -np.inf], np.nan)
+
+    # Emphasize high-volume candles; map clv into [-1,+1]
+    clv_signed = (clv * 2.0 - 1.0).fillna(0.0)
+    vz = vol_z.fillna(0.0)
+    weight = np.tanh(np.abs(vz) / 2.0)  # 0..~1
+    flow = (clv_signed * weight).rolling(5).mean()
+
+    return {
+        "vol_z": float(vz.iloc[-1]) if len(vz) else 0.0,
+        "clv": float(clv.iloc[-1]) if len(clv) else 0.5,
+        "flow_proxy": float(np.clip(flow.iloc[-1], -1, 1)) if len(flow) else 0.0,
+    }
+
+
+def diffusion_score_from_components(netflow_z: float, whale_accum: float, book_imb: float, cvd_slope: float, sopr: str) -> float:
+    """Score 0..100. Works with partial inputs.
+    If a component is missing, pass np.nan and it will be ignored with weights renormalized.
+    """
+    # component scores in 0..100
+    parts = {}
+    weights = {
+        "netflow": 0.25,
+        "whale": 0.20,
+        "book": 0.25,
+        "cvd": 0.15,
+        "sopr": 0.15,
+    }
+
+    def _score_tanh(x, scale=1.0):
+        return 50.0 + 50.0 * float(np.tanh((x or 0.0) * scale))
+
+    if np.isfinite(netflow_z):
+        parts["netflow"] = _score_tanh(netflow_z, scale=0.8)
+    if np.isfinite(whale_accum):
+        # whale_accum is expected 0..1
+        parts["whale"] = float(np.clip(whale_accum, 0, 1) * 100.0)
+    if np.isfinite(book_imb):
+        parts["book"] = 50.0 + 50.0 * float(np.tanh(book_imb * 1.5))
+    if np.isfinite(cvd_slope):
+        parts["cvd"] = 50.0 + 50.0 * float(np.tanh(cvd_slope * 5.0))
+    if sopr:
+        s = sopr.lower()
+        if "profit" in s or "above" in s or s == "positive":
+            parts["sopr"] = 65.0
+        elif "loss" in s or "below" in s or s == "negative":
+            parts["sopr"] = 35.0
+        else:
+            parts["sopr"] = 50.0
+
+    if not parts:
+        return 50.0
+
+    wsum = 0.0
+    acc = 0.0
+    for k, v in parts.items():
+        w = weights.get(k, 0.0)
+        wsum += w
+        acc += w * v
+    if wsum <= 0:
+        return 50.0
+    return float(np.clip(acc / wsum, 0, 100))
+
+
+def compute_diffusion(symbol: str, df: pd.DataFrame) -> Tuple[Dict[str, float], List[str], List[str]]:
+    """Returns metrics dict + codes + alerts."""
+    alerts: List[str] = []
+    codes: List[str] = []
+
+    # Try external analyzer if available (adds netflow/sopr mocks if no key)
+    metrics = {
+        "diffusion_score": np.nan,
+        "netflow_z": np.nan,
+        "whale_accum": np.nan,
+        "book_imbalance": np.nan,
+        "cvd_slope": np.nan,
+        "sopr": "neutral",
+    }
+
+    # Orderbook imbalance (always)
+    try:
+        book_imb, book_raw = fetch_orderbook_imbalance(symbol)
+        metrics["book_imbalance"] = float(book_imb)
+    except Exception as e:
+        alerts.append(f"Orderbook fetch failed: {e}")
+
+    # OHLCV proxy (accum/distrib)
+    try:
+        fp = flow_proxy_from_ohlcv(df)
+        # map to whale_accum proxy if none
+        if not np.isfinite(metrics["whale_accum"]):
+            metrics["whale_accum"] = float(np.clip(0.5 + 0.5 * fp["flow_proxy"], 0, 1))
+        # CVD proxy slope (very light): use sign of returns * volume
+        ret = df["Close"].pct_change().fillna(0.0)
+        cvd = (np.sign(ret) * df["Volume"].fillna(0.0)).cumsum()
+        cvd_slope = float((cvd.diff().rolling(20).mean().iloc[-1]) / (df["Volume"].rolling(20).mean().iloc[-1] + 1e-9))
+        metrics["cvd_slope"] = float(np.clip(cvd_slope, -1, 1))
+    except Exception as e:
+        alerts.append(f"CVD proxy failed: {e}")
+
+    # Optional external analyzer
+    here = Path(__file__).resolve().parent
+    ext_candidates = ["diffusion_module.py","diffusion_module_TRUECVD.py","diffusion_module_FIXED.py"]
+    ext_path = None
+    for _p in ext_candidates:
+        _cand = here / _p
+        if _cand.exists():
+            ext_path = _cand
+            break
+    if ext_path is not None and ext_path.exists():
+        try:
+            spec = importlib.util.spec_from_file_location("diffusion_fixed", str(ext_path))
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = mod
+                spec.loader.exec_module(mod)
+                analyzer = mod.DiffusionAnalyzer()
+                # If analyzer has glassnode_key field, user can set env/attr later.
+                alerts.append(f"External diffusion analyzer loaded: {ext_path.name}")
+                out = analyzer.analyze(symbol=symbol, limit=200)
+                # out is DiffusionMetrics dataclass
+                metrics["netflow_z"] = float(getattr(out, "netflow_z", metrics["netflow_z"]))
+                metrics["whale_accum"] = float(getattr(out, "whale_accumulation", metrics["whale_accum"]))
+                metrics["book_imbalance"] = float(getattr(out, "book_imbalance", metrics["book_imbalance"]))
+                metrics["cvd_slope"] = float(getattr(out, "cvd_slope", metrics["cvd_slope"]))
+                metrics["sopr"] = str(getattr(out, "sopr_trend", metrics["sopr"]))
+                # include analyzer alerts
+                a = getattr(out, "alerts", [])
+                if a:
+                    alerts.extend([str(x) for x in a])
+        except Exception as e:
+            alerts.append(f"External diffusion analyzer failed: {e}")
+
+    # Score
+    score = diffusion_score_from_components(
+        netflow_z=float(metrics["netflow_z"]) if np.isfinite(metrics["netflow_z"]) else np.nan,
+        whale_accum=float(metrics["whale_accum"]) if np.isfinite(metrics["whale_accum"]) else np.nan,
+        book_imb=float(metrics["book_imbalance"]) if np.isfinite(metrics["book_imbalance"]) else np.nan,
+        cvd_slope=float(metrics["cvd_slope"]) if np.isfinite(metrics["cvd_slope"]) else np.nan,
+        sopr=str(metrics["sopr"]),
+    )
+    metrics["diffusion_score"] = float(score)
+
+    # Codes
+    if score >= 75:
+        codes.append("DIFF_STRONG_POS")
+    elif score <= 25:
+        codes.append("DIFF_STRONG_NEG")
+    else:
+        codes.append("DIFF_NEUTRAL")
+
+    if np.isfinite(metrics.get("book_imbalance", np.nan)) and float(metrics["book_imbalance"]) > 0.70:
+        codes.append("BOOK_BUY_PRESSURE")
+    if np.isfinite(metrics.get("netflow_z", np.nan)) and float(metrics["netflow_z"]) < -0.75:
+        codes.append("NETFLOW_NEG")
+
+    return metrics, codes, alerts
+
+
+def diffusion_bias(score_0_100: float) -> float:
+    """Map diffusion score to policy bias in [-0.05,+0.05].
+    Positive score => less defensive (reduce a bit less), negative => more defensive.
+    """
+    x = (float(score_0_100) - 50.0) / 50.0  # -1..+1
+    return float(np.clip(x * 0.05, -0.05, 0.05))
+
+
+# -----------------------------------------------------------------------------
+# QC Structure (Correlation network lite)
+# -----------------------------------------------------------------------------
+
+STRUCT_BASKET_DEFAULT = ["ETHUSDT", "SOLUSDT", "BNBUSDT"]
+
+
+def structure_from_basket(
+    df_btc: pd.DataFrame,
+    interval: str,
+    bars: int,
+    basket: Optional[List[str]] = None,
+    win_long: int = 120,
+    win_short: int = 30,
+) -> Tuple[Dict[str, float], List[str]]:
+    basket = basket or STRUCT_BASKET_DEFAULT
+    rets_btc = df_btc["Close"].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    if len(rets_btc) < max(win_long, win_short) + 5:
+        return {"coherence": 0.0, "corr_break": 0.0, "n_assets": 0}, ["STRUCT_NA"]
+
+    corrs_long = []
+    corrs_short = []
+    used = 0
+
+    for sym in basket:
+        try:
+            dfx = fetch_binance_klines(sym, interval=interval, limit=int(bars))
+            rx = dfx["Close"].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+            idx = rets_btc.index.intersection(rx.index)
+            if len(idx) < max(win_long, win_short) + 5:
+                continue
+            a = rets_btc.loc[idx]
+            b = rx.loc[idx]
+            # rolling corr last value
+            c_long = a.rolling(win_long).corr(b).iloc[-1]
+            c_short = a.rolling(win_short).corr(b).iloc[-1]
+            if np.isfinite(c_long) and np.isfinite(c_short):
+                corrs_long.append(float(c_long))
+                corrs_short.append(float(c_short))
+                used += 1
+        except Exception:
+            continue
+
+    if used == 0:
+        return {"coherence": 0.0, "corr_break": 0.0, "n_assets": 0}, ["STRUCT_NA"]
+
+    coherence = float(np.mean(np.abs(corrs_long)))
+    corr_break = float(np.mean(corrs_short) - np.mean(corrs_long))
+
+    codes: List[str] = []
+    # High coherence = systemic risk-on/off; with stress it can mean cascade risk.
+    if coherence >= 0.75:
+        codes.append("STRUCT_COHERENT")
+    elif coherence <= 0.35:
+        codes.append("STRUCT_FRAGMENTED")
+    else:
+        codes.append("STRUCT_MIXED")
+
+    # Break: short corr rising vs long => re-coupling
+    if corr_break >= 0.20:
+        codes.append("CORR_RECOUPLING")
+    elif corr_break <= -0.20:
+        codes.append("CORR_DECOUPLING")
+
+    return {"coherence": coherence, "corr_break": corr_break, "n_assets": used}, codes
+
+
+def structure_bias(coherence: float, corr_break: float, regime: Dict[str, object]) -> float:
+    """Bias in [-0.05,+0.05].
+    - If coherence is very high AND stress is not passing -> become more defensive.
+    - If decoupling (lower corr) while no stress cluster and bear is easing -> allow slightly less defense.
+    """
+    bear = bool(regime.get("bear_active", False))
+    stress_pass = bool(regime.get("stress_pass", True))
+    stress_cluster = bool(regime.get("stress_cluster_on", False))
+
+    b = 0.0
+    if stress_cluster:
+        return 0.0
+
+    if coherence >= 0.75 and (bear or (not stress_pass)):
+        b -= 0.03
+
+    if corr_break <= -0.20 and stress_pass:
+        b += 0.02
+
+    return float(np.clip(b, -0.05, 0.05))
+
+
+# -----------------------------------------------------------------------------
+# Policy wrapper: call base unified_policy then nudge reduce_pct
+# -----------------------------------------------------------------------------
+
+def _apply_qc_to_decision(dec: Decision, event_bias: float, diff_b: float, struct_b: float,
+                          diff_codes: List[str], struct_codes: List[str],
+                          diff_metrics: Dict[str, float], struct_metrics: Dict[str, float],
+                          diff_alerts: List[str]) -> Decision:
+    # copy decision
+    action = dec.action
+    policy_state = dec.policy_state
+    allowed = list(dec.allowed_actions)
+    reason = list(dec.reason_codes)
+
+    # attach codes
+    for c in (diff_codes or []):
+        if c not in reason:
+            reason.append(c)
+    for c in (struct_codes or []):
+        if c not in reason:
+            reason.append(c)
+
+    # QC Bias only affects reduce_pct when in REDUCE
+    reduce_pct = float(dec.reduce_pct)
+    if policy_state == "REDUCE" and reduce_pct > 0:
+        # event bias already applied in v7 baseline; here we apply additional bias
+        # positive bias -> smaller reduce
+        total_bias = float(np.clip(diff_b + struct_b, -0.08, 0.08))
+        reduce_pct = float(np.clip(reduce_pct - total_bias, 0.20, 0.50))
+
+        # map to nearest ladder level for readability
+        ladder = sorted(REDUCE_LEVELS)
+        reduce_pct = min(ladder, key=lambda x: abs(x - reduce_pct))
+
+    extra = dict(dec.extra or {})
+    extra["diffusion"] = {**diff_metrics, "alerts": diff_alerts}
+    extra["structure"] = {**struct_metrics}
+    extra["qc"] = {
+        "event_bias": float(event_bias),
+        "diff_bias": float(diff_b),
+        "struct_bias": float(struct_b),
+        "total_bias": float(np.clip(diff_b + struct_b, -0.08, 0.08)),
+    }
+
+    return Decision(
+        action=action,
+        policy_state=policy_state,
+        allowed_actions=allowed,
+        reason_codes=reason if reason else ["NO_EDGE"],
+        target_exposure=float(dec.target_exposure),
+        reduce_pct=float(reduce_pct),
+        size_frac=float(dec.size_frac),
+        stop=dec.stop,
+        target=dec.target,
+        p_up=float(dec.p_up),
+        ev=float(dec.ev),
+        regime=dict(dec.regime),
+        extra=extra,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Public API: predict_latest
+# -----------------------------------------------------------------------------
+
+def predict_latest(
+    model: object,
+    df: pd.DataFrame,
+    horizon: int = 5,
+    execution_mode: str = EXEC_SPOT,
+    education_mode: bool = True,
+    event_bias: float = 0.0,
+    event_codes: Optional[list] = None,
+    symbol: str = "BTCUSDT",
+    interval: str = "1h",
+    bars: int = 1000,
+    basket: Optional[List[str]] = None,
+) -> Decision:
+    # Base decision
+    dec = BASE.predict_latest(
+        model,
+        df,
+        horizon=int(horizon),
+        execution_mode=execution_mode,
+        education_mode=education_mode,
+        event_bias=float(event_bias),
+        event_codes=event_codes,
+    )
+
+    # If base didn't produce regime, return as is
+    regime = dict(dec.regime or {})
+
+    # QC: diffusion
+    diff_metrics, diff_codes, diff_alerts = compute_diffusion(symbol=symbol, df=df)
+    diff_b = diffusion_bias(float(diff_metrics.get("diffusion_score", 50.0)))
+
+    # QC: structure
+    try:
+        struct_metrics, struct_codes = structure_from_basket(
+            df_btc=df,
+            interval=interval,
+            bars=int(bars),
+            basket=basket,
+        )
+    except Exception:
+        struct_metrics, struct_codes = ({"coherence": 0.0, "corr_break": 0.0, "n_assets": 0}, ["STRUCT_FAIL"])
+    struct_b = structure_bias(
+        coherence=float(struct_metrics.get("coherence", 0.0)),
+        corr_break=float(struct_metrics.get("corr_break", 0.0)),
+        regime=regime,
+    )
+
+    return _apply_qc_to_decision(
+        dec=dec,
+        event_bias=float(event_bias),
+        diff_b=diff_b,
+        struct_b=struct_b,
+        diff_codes=diff_codes,
+        struct_codes=struct_codes,
+        diff_metrics=diff_metrics,
+        struct_metrics=struct_metrics,
+        diff_alerts=diff_alerts,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Fallback: if user wants rules-only decision (no model)
+# -----------------------------------------------------------------------------
+
+def predict_latest_rules_only(
+    df: pd.DataFrame,
+    horizon: int = 5,
+    execution_mode: str = EXEC_SPOT,
+    education_mode: bool = True,
+    event_bias: float = 0.0,
+    event_codes: Optional[list] = None,
+    symbol: str = "BTCUSDT",
+    interval: str = "1h",
+    bars: int = 1000,
+    basket: Optional[List[str]] = None,
+) -> Decision:
+    # Train a quick model is not available; instead use base unified policy with p_up=0.5, ev=0
+    df1 = build_features(df)
+    df1["label"] = forward_return_label(df1, horizon=horizon, thr=0.0)
+    ok, issues, df_valid = quality_gates(df1, horizon=horizon)
+    if not ok:
+        raise ValueError("Quality gates failed: " + str(issues))
+
+    mean_psi, _ = BASE.drift_report(df_valid)
+    regime = BASE.compute_regime(df)
+
+    dec = BASE.unified_policy(
+        df=df,
+        p_up=0.5,
+        ev=0.0,
+        mean_psi=float(mean_psi),
+        regime=regime,
+        event_bias=float(event_bias),
+        event_codes=event_codes,
+        execution_mode=execution_mode,
+        education_mode=education_mode,
+    )
+
+    diff_metrics, diff_codes, diff_alerts = compute_diffusion(symbol=symbol, df=df)
+    diff_b = diffusion_bias(float(diff_metrics.get("diffusion_score", 50.0)))
+
+    struct_metrics, struct_codes = structure_from_basket(
+        df_btc=df,
+        interval=interval,
+        bars=int(bars),
+        basket=basket,
+    )
+    struct_b = structure_bias(
+        coherence=float(struct_metrics.get("coherence", 0.0)),
+        corr_break=float(struct_metrics.get("corr_break", 0.0)),
+        regime=regime,
+    )
+
+    return _apply_qc_to_decision(
+        dec=dec,
+        event_bias=float(event_bias),
+        diff_b=diff_b,
+        struct_b=struct_b,
+        diff_codes=diff_codes,
+        struct_codes=struct_codes,
+        diff_metrics=diff_metrics,
+        struct_metrics=struct_metrics,
+        diff_alerts=diff_alerts,
+    )
+
+# === FETCH BRIDGE (AUTO-PATCH) BEGIN ===
+# This block was auto-inserted to satisfy dashboards that expect:
+#   - fetch_ohlcv_binance(symbol, interval, limit)
+#   - fetch_ohlcv(symbol, interval, limit)
+# Optional:
+#   - fetch_fred_series(series_id)
+#
+# Primary: Binance klines
+# Fallback: yfinance (best-effort mapping for interval)
+
+import pandas as _pd
+
+def fetch_ohlcv_binance(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 1000) -> _pd.DataFrame:
+    \"\"\"Fetch OHLCV from Binance public API (klines).\"\"\"
+    import requests
+    url = "https://api.binance.com/api/v3/klines"
+    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": int(limit)}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    rows = []
+    for k in data:
+        rows.append({
+            "ts": int(k[0]) // 1000,
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+        })
+
+    df = _pd.DataFrame(rows)
+    df["datetime"] = _pd.to_datetime(df["ts"], unit="s", utc=True)
+    return df.sort_values("ts").reset_index(drop=True)
+
+def _yf_interval_map(interval: str) -> str:
+    m = {
+        "1m":"1m","3m":"5m","5m":"5m","15m":"15m","30m":"30m",
+        "1h":"1h","2h":"1h","4h":"1h","6h":"1h","8h":"1h","12h":"1h",
+        "1d":"1d","3d":"1d","1w":"1wk"
+    }
+    return m.get(interval, "1h")
+
+def fetch_ohlcv_yfinance(symbol: str = "BTC-USD", interval: str = "1h", limit: int = 1000) -> _pd.DataFrame:
+    \"\"\"Fetch OHLCV from yfinance (best-effort).\"\"\"
+    import yfinance as yf
+    yf_interval = _yf_interval_map(interval)
+    period = "60d" if yf_interval in ("1m","2m","5m","15m","30m","60m","90m","1h") else "2y"
+
+    data = yf.download(symbol, period=period, interval=yf_interval, progress=False)
+    if data is None or data.empty:
+        raise RuntimeError("yfinance returned empty data")
+
+    df = data.reset_index().rename(columns={
+        "Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"
+    })
+
+    # handle datetime col name variations
+    dt_col = None
+    for c in ("Datetime","Date"):
+        if c in df.columns:
+            dt_col = c
+            break
+    if dt_col is None:
+        dt_col = df.columns[0]
+    df = df.rename(columns={dt_col:"datetime"})
+    df["datetime"] = _pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+    df = df.dropna(subset=["datetime"])
+    df["ts"] = (df["datetime"].astype("int64") // 10**9).astype("int64")
+    df = df[["ts","open","high","low","close","volume","datetime"]].sort_values("ts")
+
+    if len(df) > int(limit):
+        df = df.tail(int(limit))
+    return df.reset_index(drop=True)
+
+def fetch_ohlcv(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 1000) -> _pd.DataFrame:
+    \"\"\"Unified fetch: Binance first, fallback to yfinance.\"\"\"
+    try:
+        return fetch_ohlcv_binance(symbol=symbol, interval=interval, limit=limit)
+    except Exception:
+        yf_symbol = symbol
+        if yf_symbol.endswith("USDT"):
+            yf_symbol = yf_symbol.replace("USDT", "-USD")
+        return fetch_ohlcv_yfinance(symbol=yf_symbol, interval=interval, limit=limit)
+
+def fetch_fred_series(series_id: str):
+    \"\"\"Optional: Fetch latest value for a FRED series. Needs FRED_API_KEY + fredapi.\"\"\"
+    import os as _os
+    key = _os.getenv("FRED_API_KEY", "")
+    if not key:
+        raise RuntimeError("FRED_API_KEY env var not set")
+    try:
+        from fredapi import Fred
+    except Exception as e:
+        raise RuntimeError("fredapi not installed. Run: py -3.11 -m pip install fredapi") from e
+    fred = Fred(api_key=key)
+    s = fred.get_series(series_id)
+    if s is None or len(s) == 0:
+        raise RuntimeError(f"FRED series empty: {series_id}")
+    last_date = str(s.index[-1].date())
+    last_val = float(s.iloc[-1])
+    return {"series": series_id, "date": last_date, "value": last_val}
+
+# === FETCH BRIDGE (AUTO-PATCH) END ===

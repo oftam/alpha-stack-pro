@@ -1,0 +1,29 @@
+{
+  "ticker": "BTC-USD",
+  "generated_at_utc": "2026-02-02T21:40:16Z",
+  "engine": "Heuristic (fast)",
+  "p_up": 0.54,
+  "confidence": 0.1,
+  "recommendation": "HOLD",
+  "ev_yes": -0.010000000000000009,
+  "ev_no": 0.010000000000000009,
+  "edge": 0.010000000000000009,
+  "engine_info": {
+    "engine_used": "Heuristic",
+    "components": {
+      "rsi": 25,
+      "zones": 20,
+      "divergence": -20,
+      "trend": -15
+    },
+    "rsi_current": 21.389658855200466
+  },
+  "baseline": null,
+  "data_drift": null,
+  "model_drift": null,
+  "gates_passed": true,
+  "gate_reasons": [],
+  "should_send": true,
+  "telegram_ok": true,
+  "telegram_status": "Sent"
+}

@@ -1,0 +1,18 @@
+# ELITE v20 Dashboard Requirements
+# =================================
+
+# Core Dashboard (already installed)
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.14.0
+requests>=2.31.0
+
+# Claude AI Integration (NEW!)
+# -----------------------------
+anthropic>=0.18.0
+
+# Optional (if needed for advanced features)
+# ------------------------------------------
+# python-telegram-bot>=20.0  # for Telegram bot
+# openai>=1.0.0              # if you want to compare with OpenAI

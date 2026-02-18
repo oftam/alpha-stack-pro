@@ -1,0 +1,40 @@
+# ================================================
+# EXECUTIVE ORDERS v3.4 PRO - Environment Configuration
+# ================================================
+
+# ==================== FINNHUB API ====================
+FINNHUB_API_KEY=d5t9io9r01qt62ni3ujgd5t9io9r01qt62ni3uk0
+
+# ==================== TWILIO (WhatsApp Notifications) ====================
+# Get from: https://www.twilio.com/console
+TWILIO_ACCOUNT_SID=your_account_sid_here
+TWILIO_AUTH_TOKEN=your_auth_token_here
+
+# WhatsApp Numbers (format: whatsapp:+country_code_number)
+# Example: whatsapp:+1234567890 or whatsapp:+972512345678
+TWILIO_PHONE_FROM=whatsapp:+1234567890
+TWILIO_PHONE_TO=whatsapp:+972512345678
+
+# ==================== GOOGLE APIS ====================
+# Service Account Credentials file (download from Google Cloud Console)
+GOOGLE_CREDENTIALS_FILE=credentials.json
+
+# Google Sheets ID (from your spreadsheet URL)
+# https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit
+GOOGLE_SHEETS_ID=your_sheet_id_here
+
+# Gmail addresses
+# FROM: Service account email (from credentials.json)
+# TO: Your personal Gmail address
+GOOGLE_EMAIL_FROM=your-service-account@project.iam.gserviceaccount.com
+GOOGLE_EMAIL_TO=your_personal_email@gmail.com
+
+# ==================== BINANCE API (Optional) ====================
+# If you want to trade on Binance
+BINANCE_API_KEY=your_binance_api_key
+BINANCE_API_SECRET=your_binance_api_secret
+
+# ==================== TRADING CONFIG ====================
+POSITION_SIZE_PCT=0.02
+MAX_DAILY_LOSS_PCT=2.0
+MAX_TRADES_PER_DAY=5

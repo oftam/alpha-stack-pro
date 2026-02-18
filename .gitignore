@@ -1,0 +1,48 @@
+# ============================================
+# 🔐 ELITE v20 - Security First .gitignore
+# ============================================
+
+# === API KEYS & SECRETS (קריטי!) ===
+secrets.toml
+.env
+.env.*
+.streamlit/secrets.toml
+*.key
+*.pem
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === Data & State ===
+*.db
+*.sqlite
+data/*.json
+memory_logs/
+*.log
+
+# === Archive (old versions, large) ===
+archive/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# === Streamlit cache ===
+.streamlit_cache/
+
+# === ngrok ===
+ngrok.yml

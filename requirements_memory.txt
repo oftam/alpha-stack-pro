@@ -1,0 +1,19 @@
+# Elite v20 - Memory System Requirements
+# =======================================
+
+# Core dependencies
+supabase==2.0.3          # PostgreSQL client
+cohere==5.0.0            # Embeddings for similarity search
+python-dotenv==1.0.0     # Environment variables
+
+# Optional but recommended
+python-telegram-bot==20.8  # Telegram notifications
+pgvector==0.2.4           # Vector operations (if local testing)
+psycopg2-binary==2.9.9    # Direct PostgreSQL access
+
+# Already installed (from Elite v20)
+streamlit
+pandas
+numpy
+requests
+ccxt

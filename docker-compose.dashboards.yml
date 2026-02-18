@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  dashboards:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboards
+    container_name: alpha-stack-dashboards
+    restart: unless-stopped
+    ports:
+      - "8510:8510"
+      - "8511:8511"
+      - "8512:8512"
+    env_file:
+      - .env
+    environment:
+      - PYTHONIOENCODING=utf-8
+    volumes:
+      - dashboard-data:/app/data
+      - dashboard-logs:/app/logs
+
+volumes:
+  dashboard-data:
+  dashboard-logs:

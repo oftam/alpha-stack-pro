@@ -1,0 +1,558 @@
+﻿# ============================================================
+# QUANT WAR ROOM ג€” FULL ONE-FILE (Streamlit)
+# - BTC from Binance (stable)
+# - Coinbase Premium (Coinbase - Binance)
+# - Fear & Greed (Alternative.me)
+# - VIX / DXY / Gold / Silver via Stooq (daily) with simple labels
+# - Smart scoring engine (-100..+100) + Signal label
+# - Telegram manual button + auto-alert on thresholds
+#
+# Requirements:
+#   pip install streamlit pandas numpy requests pandas-ta-openbb
+#
+# Run (PowerShell):
+#   $py="C:\Users\ofirt\AppData\Local\Python\pythoncore-3.14-64\python.exe"
+#   cd C:\Users\ofirt\Documents\alpha-stack-pro
+#   & $py -m streamlit run .\quant-war-room-win_FULL.py
+# ============================================================
+
+from __future__ import annotations
+
+import time
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+
+# pandas_ta (installed via pandas-ta-openbb). If missing, we'll fall back to minimal calc.
+try:
+    import pandas_ta as ta
+except Exception:
+    ta = None
+
+BINANCE_BASE = "https://api.binance.com"
+COINBASE_EXCHANGE = "https://api.exchange.coinbase.com"
+COINBASE_SPOT = "https://api.coinbase.com"
+STOOQ_CSV = "https://stooq.com/q/d/l/"
+FNG_API = "https://api.alternative.me/fng/"
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="QUANT WAR ROOM", layout="wide")
+st.title("נ¯ QUANT WAR ROOM")
+st.caption("׳׳¢׳¨׳›׳× ׳׳•׳“׳™׳¢׳™׳ ׳₪׳™׳ ׳ ׳¡׳™׳× ׳׳׳׳” | Real-Time Quant Analysis")
+
+if "last_alert_bucket" not in st.session_state:
+    st.session_state["last_alert_bucket"] = None
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def safe_get_json(url: str, params=None, headers=None, timeout=20) -> dict:
+    r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def safe_get_text(url: str, params=None, timeout=20) -> str:
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.text
+
+def now_str() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+def pct(a: float, b: float) -> float:
+    # percent change from b -> a
+    if b == 0:
+        return 0.0
+    return (a / b - 1.0) * 100.0
+
+
+# -----------------------------
+# Data fetchers
+# -----------------------------
+@st.cache_data(ttl=20, show_spinner=False)
+def binance_24h(symbol: str = "BTCUSDT") -> dict:
+    # 24h ticker includes price + change%
+    url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
+    return safe_get_json(url, params={"symbol": symbol})
+
+@st.cache_data(ttl=60, show_spinner=False)
+def binance_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 720) -> pd.DataFrame:
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    data = safe_get_json(url, params={"symbol": symbol, "interval": interval, "limit": int(limit)})
+    cols = ["OpenTime","Open","High","Low","Close","Volume","CloseTime","QAV","Trades","TBBase","TBQuote","Ignore"]
+    df = pd.DataFrame(data, columns=cols)
+    df["OpenTime"] = pd.to_datetime(df["OpenTime"], unit="ms", utc=True).dt.tz_convert(None)
+    df = df.set_index("OpenTime")
+    for c in ["Open","High","Low","Close","Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df[["Open","High","Low","Close","Volume"]].dropna()
+
+@st.cache_data(ttl=20, show_spinner=False)
+def coinbase_btc_price() -> float:
+    # Coinbase Exchange ticker
+    try:
+        j = safe_get_json(f"{COINBASE_EXCHANGE}/products/BTC-USD/ticker", headers={"User-Agent": "Mozilla/5.0"})
+        return float(j["price"])
+    except Exception:
+        # Fallback to Coinbase spot API
+        j = safe_get_json(f"{COINBASE_SPOT}/v2/prices/BTC-USD/spot", headers={"User-Agent": "Mozilla/5.0"})
+        return float(j["data"]["amount"])
+
+@st.cache_data(ttl=60, show_spinner=False)
+def stooq_ohlc(symbol: str, interval: str = "d") -> pd.DataFrame:
+    # interval: "d" (daily). stooq supports d for our use here.
+    # Example symbols: vix, usd_i, xauusd, xagusd
+    text = safe_get_text(STOOQ_CSV, params={"s": symbol.lower(), "i": interval})
+    from io import StringIO
+    df = pd.read_csv(StringIO(text))
+    if "Date" not in df.columns:
+        raise RuntimeError(f"Stooq bad format for {symbol}")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+    return df[["Open","High","Low","Close","Volume"]].dropna()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fear_greed_now() -> Tuple[int, str]:
+    # Alternative.me Fear & Greed
+    j = safe_get_json(FNG_API, params={"limit": 1, "format": "json"})
+    item = j["data"][0]
+    return int(item["value"]), str(item["value_classification"])
+
+def try_last_close(df: pd.DataFrame) -> float:
+    if df is None or df.empty:
+        return float("nan")
+    return float(df["Close"].iloc[-1])
+
+def try_prev_close(df: pd.DataFrame) -> float:
+    if df is None or len(df) < 2:
+        return float("nan")
+    return float(df["Close"].iloc[-2])
+
+
+# -----------------------------
+# Indicators
+# -----------------------------
+def SMA(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n).mean()
+
+def RSI(close: pd.Series, n: int = 14) -> pd.Series:
+    if ta is not None:
+        return ta.rsi(close, length=n)
+    delta = close.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=close.index).rolling(n).mean()
+    roll_down = pd.Series(down, index=close.index).rolling(n).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+def EMA(close: pd.Series, n: int) -> pd.Series:
+    if ta is not None:
+        return ta.ema(close, length=n)
+    return close.ewm(span=n, adjust=False).mean()
+
+def MACD(close: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    if ta is not None:
+        m = ta.macd(close)
+        # columns: MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
+        return m.iloc[:,0], m.iloc[:,2], m.iloc[:,1]
+    ema12 = EMA(close, 12)
+    ema26 = EMA(close, 26)
+    macd = ema12 - ema26
+    signal = EMA(macd, 9)
+    hist = macd - signal
+    return macd, signal, hist
+
+def BOLL(close: pd.Series, n: int = 20, k: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ma = close.rolling(n).mean()
+    sd = close.rolling(n).std()
+    upper = ma + k * sd
+    lower = ma - k * sd
+    return lower, ma, upper
+
+
+# -----------------------------
+# Scoring Engine
+# -----------------------------
+@dataclass
+class ScoreItem:
+    name: str
+    points: int
+    detail: str
+
+def bucket_from_score(score: int) -> str:
+    if score >= 30:
+        return "STRONG_BUY"
+    if score >= 10:
+        return "BUY"
+    if score > -10:
+        return "HOLD"
+    if score > -30:
+        return "SELL"
+    return "STRONG_SELL"
+
+def score_to_emoji(bucket: str) -> str:
+    return {
+        "STRONG_BUY": "נ¢",
+        "BUY": "נ¢",
+        "HOLD": "ג×",
+        "SELL": "נ”´",
+        "STRONG_SELL": "נ”´",
+    }.get(bucket, "ג×")
+
+
+def build_score(
+    df_btc: pd.DataFrame,
+    coinbase_premium_pct: float,
+    vix: float,
+    dxy: float,
+    fng_value: int,
+    weights: Dict[str, int],
+    thresholds: Dict[str, float],
+) -> Tuple[int, List[ScoreItem]]:
+    items: List[ScoreItem] = []
+    score = 0
+
+    close = df_btc["Close"]
+    sma10 = SMA(close, 10)
+    sma50 = SMA(close, 50)
+    rsi14 = RSI(close, 14)
+    macd, macd_sig, macd_hist = MACD(close)
+    bb_lo, bb_mid, bb_hi = BOLL(close, 20, 2.0)
+
+    # Golden/Death Cross detection (today vs yesterday)
+    if len(close) >= 55:
+        prev = sma10.iloc[-2] - sma50.iloc[-2]
+        curr = sma10.iloc[-1] - sma50.iloc[-1]
+        if prev <= 0 and curr > 0:
+            pts = weights["cross"]
+            items.append(ScoreItem("Golden Cross", +pts, "SMA10 ׳—׳¦׳” ׳׳¢׳ SMA50"))
+            score += pts
+        elif prev >= 0 and curr < 0:
+            pts = weights["cross"]
+            items.append(ScoreItem("Death Cross", -pts, "SMA10 ׳—׳¦׳” ׳׳×׳—׳× SMA50"))
+            score -= pts
+        else:
+            # trend bias
+            if curr > 0:
+                items.append(ScoreItem("Trend", +weights["trend"], "SMA10 ׳׳¢׳ SMA50 (׳׳’׳׳” ׳—׳™׳•׳‘׳™׳×)"))
+                score += weights["trend"]
+            elif curr < 0:
+                items.append(ScoreItem("Trend", -weights["trend"], "SMA10 ׳׳×׳—׳× SMA50 (׳׳’׳׳” ׳—׳׳©׳”)"))
+                score -= weights["trend"]
+
+    # RSI
+    r = float(rsi14.iloc[-1]) if pd.notna(rsi14.iloc[-1]) else np.nan
+    if np.isfinite(r):
+        if r <= thresholds["rsi_buy"]:
+            items.append(ScoreItem("RSI", +weights["rsi"], f"RSI={r:.1f} (Oversold)"))
+            score += weights["rsi"]
+        elif r >= thresholds["rsi_sell"]:
+            items.append(ScoreItem("RSI", -weights["rsi"], f"RSI={r:.1f} (Overbought)"))
+            score -= weights["rsi"]
+        else:
+            items.append(ScoreItem("RSI", 0, f"RSI={r:.1f} (׳׳–׳•׳¨ ׳‘׳¨׳™׳)"))
+
+    # MACD cross / bias
+    if len(close) >= 35:
+        prev_h = float(macd_hist.iloc[-2])
+        curr_h = float(macd_hist.iloc[-1])
+        if prev_h <= 0 and curr_h > 0:
+            items.append(ScoreItem("MACD", +weights["macd"], "MACD ׳”׳™׳₪׳•׳ ׳׳©׳•׳¨׳™"))
+            score += weights["macd"]
+        elif prev_h >= 0 and curr_h < 0:
+            items.append(ScoreItem("MACD", -weights["macd"], "MACD ׳”׳™׳₪׳•׳ ׳׳“׳•׳‘׳™"))
+            score -= weights["macd"]
+        else:
+            items.append(ScoreItem("MACD", 0, f"Histogram={curr_h:.4f}"))
+
+    # Bollinger
+    last_close = float(close.iloc[-1])
+    lo = float(bb_lo.iloc[-1]) if pd.notna(bb_lo.iloc[-1]) else np.nan
+    hi = float(bb_hi.iloc[-1]) if pd.notna(bb_hi.iloc[-1]) else np.nan
+    if np.isfinite(lo) and np.isfinite(hi):
+        if last_close < lo:
+            items.append(ScoreItem("Bollinger", +weights["boll"], "׳׳×׳—׳× ׳-Lower Band (׳“׳—׳™׳₪׳” ׳§׳•׳ ׳˜׳¨׳”)"))
+            score += weights["boll"]
+        elif last_close > hi:
+            items.append(ScoreItem("Bollinger", -weights["boll"], "׳׳¢׳ Upper Band (׳—׳ ׳׳“׳™)"))
+            score -= weights["boll"]
+        else:
+            items.append(ScoreItem("Bollinger", 0, "׳‘׳×׳•׳ ׳”׳׳”׳§׳•׳×"))
+
+    # Coinbase Premium
+    if coinbase_premium_pct >= thresholds["premium_hi"]:
+        items.append(ScoreItem("Coinbase Premium", +weights["premium"], f"{coinbase_premium_pct:.2f}% (׳›׳¡׳£ ׳׳•׳¡׳“׳™ ׳ ׳›׳ ׳¡)"))
+        score += weights["premium"]
+    elif coinbase_premium_pct <= -thresholds["premium_hi"]:
+        items.append(ScoreItem("Coinbase Premium", -weights["premium"], f"{coinbase_premium_pct:.2f}% (׳׳—׳¥ ׳‘׳¦׳“ Coinbase)"))
+        score -= weights["premium"]
+    else:
+        items.append(ScoreItem("Coinbase Premium", 0, f"{coinbase_premium_pct:.2f}%"))
+
+    # VIX
+    if np.isfinite(vix):
+        if vix <= thresholds["vix_low"]:
+            items.append(ScoreItem("VIX", +weights["vix"], f"{vix:.1f} (׳‘׳™׳˜׳—׳•׳)"))
+            score += weights["vix"]
+        elif vix >= thresholds["vix_high"]:
+            items.append(ScoreItem("VIX", -weights["vix"], f"{vix:.1f} (׳₪׳—׳“)"))
+            score -= weights["vix"]
+        else:
+            items.append(ScoreItem("VIX", 0, f"{vix:.1f} (׳ ׳™׳˜׳¨׳׳™)"))
+
+    # DXY
+    if np.isfinite(dxy):
+        if dxy <= thresholds["dxy_weak"]:
+            items.append(ScoreItem("DXY", +weights["dxy"], f"{dxy:.2f} (׳“׳•׳׳¨ ׳—׳׳©)"))
+            score += weights["dxy"]
+        elif dxy >= thresholds["dxy_strong"]:
+            items.append(ScoreItem("DXY", -weights["dxy"], f"{dxy:.2f} (׳“׳•׳׳¨ ׳—׳–׳§)"))
+            score -= weights["dxy"]
+        else:
+            items.append(ScoreItem("DXY", 0, f"{dxy:.2f} (׳ ׳™׳˜׳¨׳׳™)"))
+
+    # Fear & Greed (contrarian)
+    if fng_value <= thresholds["fng_fear"]:
+        items.append(ScoreItem("Fear&Greed", +weights["fng"], f"{fng_value} (Fear ג†’ ׳§׳•׳ ׳˜׳¨׳” ׳§׳ ׳™׳™׳”)"))
+        score += weights["fng"]
+    elif fng_value >= thresholds["fng_greed"]:
+        items.append(ScoreItem("Fear&Greed", -weights["fng"], f"{fng_value} (Greed ג†’ ׳§׳•׳ ׳˜׳¨׳” ׳׳›׳™׳¨׳”)"))
+        score -= weights["fng"]
+    else:
+        items.append(ScoreItem("Fear&Greed", 0, f"{fng_value} (׳ ׳™׳˜׳¨׳׳™)"))
+
+    # Clamp
+    score = int(max(min(score, 100), -100))
+    return score, items
+
+
+# -----------------------------
+# Telegram
+# -----------------------------
+def telegram_send(bot_token: str, chat_id: str, text: str) -> bool:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    r = requests.post(url, json=payload, timeout=20)
+    return r.status_code == 200
+
+
+# -----------------------------
+# Sidebar controls
+# -----------------------------
+st.sidebar.header("ג™ן¸ ׳”׳’׳“׳¨׳•׳×")
+
+symbol_ui = st.sidebar.text_input("׳¡׳™׳׳•׳", value="BTC-USD").strip()  # kept for UX
+period_ui = st.sidebar.selectbox("׳˜׳•׳•׳— ׳–׳׳", ["5d", "1mo", "3mo", "6mo"], index=1)
+interval_ui = st.sidebar.selectbox("׳׳™׳ ׳˜׳¨׳•׳•׳", ["15m", "30m", "1h", "2h", "4h"], index=2)
+
+st.sidebar.divider()
+auto_refresh = st.sidebar.toggle("׳¨׳¢׳ ׳•׳ ׳׳•׳˜׳•׳׳˜׳™", value=True)
+refresh_sec = st.sidebar.slider("׳©׳ ׳™׳•׳× ׳׳¨׳¢׳ ׳•׳", 5, 60, 10, 5)
+show_debug = st.sidebar.toggle("׳”׳¦׳’ Debug ׳׳׳", value=False)
+
+st.sidebar.divider()
+st.sidebar.subheader("ג–ן¸ ׳׳©׳§׳׳™׳")
+weights = {
+    "rsi": st.sidebar.slider("RSI weight", 0, 30, 15, 1),
+    "cross": st.sidebar.slider("Cross weight", 0, 30, 20, 1),
+    "trend": st.sidebar.slider("Trend bias", 0, 20, 8, 1),
+    "macd": st.sidebar.slider("MACD weight", 0, 20, 10, 1),
+    "boll": st.sidebar.slider("Bollinger weight", 0, 20, 10, 1),
+    "premium": st.sidebar.slider("Coinbase Premium weight", 0, 40, 25, 1),
+    "vix": st.sidebar.slider("VIX weight", 0, 20, 10, 1),
+    "dxy": st.sidebar.slider("DXY weight", 0, 25, 15, 1),
+    "fng": st.sidebar.slider("Fear&Greed weight", 0, 30, 20, 1),
+}
+
+st.sidebar.divider()
+st.sidebar.subheader("נן¸ ׳¡׳₪׳™׳")
+thresholds = {
+    "rsi_buy": st.sidebar.slider("RSI buy <= ", 10, 50, 30, 1),
+    "rsi_sell": st.sidebar.slider("RSI sell >= ", 50, 95, 70, 1),
+    "premium_hi": st.sidebar.slider("Premium abs% >= ", 0.05, 1.00, 0.20, 0.05),
+    "vix_low": st.sidebar.slider("VIX low <= ", 10.0, 25.0, 20.0, 0.5),
+    "vix_high": st.sidebar.slider("VIX high >= ", 20.0, 60.0, 30.0, 0.5),
+    "dxy_weak": st.sidebar.slider("DXY weak <= ", 90.0, 110.0, 102.0, 0.5),
+    "dxy_strong": st.sidebar.slider("DXY strong >= ", 95.0, 120.0, 106.0, 0.5),
+    "fng_fear": st.sidebar.slider("F&G fear <= ", 0, 50, 25, 1),
+    "fng_greed": st.sidebar.slider("F&G greed >= ", 50, 100, 75, 1),
+}
+
+st.sidebar.divider()
+st.sidebar.subheader("נ“± Telegram (׳׳•׳₪׳¦׳™׳•׳ ׳׳™)")
+tg_token = st.sidebar.text_input("BOT TOKEN", value="", type="password")
+tg_chat = st.sidebar.text_input("CHAT ID", value="")
+
+alert_pos = st.sidebar.slider("׳©׳׳— ׳”׳×׳¨׳׳” ׳׳ score >= ", 10, 100, 30, 1)
+alert_neg = st.sidebar.slider("׳©׳׳— ׳”׳×׳¨׳׳” ׳׳ score <= ", -100, -10, -30, 1)
+
+
+# -----------------------------
+# Main load
+# -----------------------------
+# BTC settings mapped from UI
+interval_map = {"15m": "15m", "30m": "30m", "1h": "1h", "2h": "2h", "4h": "4h"}
+interval = interval_map.get(interval_ui, "1h")
+
+period_limit_map = {"5d": 120, "1mo": 720, "3mo": 1000, "6mo": 1000}
+limit = period_limit_map.get(period_ui, 720)
+
+try:
+    # 1) BTC (Binance)
+    t24 = binance_24h("BTCUSDT")
+    btc_price = float(t24["lastPrice"])
+    btc_chg_pct = float(t24["priceChangePercent"])
+    btc_chg = float(t24["priceChange"])
+
+    df_btc = binance_klines("BTCUSDT", interval=interval, limit=limit)
+
+    # 2) Coinbase premium
+    cb_price = coinbase_btc_price()
+    premium_pct = pct(cb_price, btc_price)
+
+    # 3) Fear & Greed
+    fng_val, fng_cls = fear_greed_now()
+
+    # 4) VIX / DXY / Gold / Silver (Stooq daily)
+    vix_df = stooq_ohlc("vi.f", "d")
+    dxy_df = stooq_ohlc("usd_i", "d")        # Stooq U.S. Dollar Index
+    gold_df = stooq_ohlc("xauusd", "d")
+    silv_df = stooq_ohlc("xagusd", "d")
+
+    vix = try_last_close(vix_df)
+    dxy = try_last_close(dxy_df)
+    gold = try_last_close(gold_df)
+    silver = try_last_close(silv_df)
+
+    # 5) Score
+    score, items = build_score(
+        df_btc=df_btc,
+        coinbase_premium_pct=premium_pct,
+        vix=vix,
+        dxy=dxy,
+        fng_value=fng_val,
+        weights=weights,
+        thresholds=thresholds,
+    )
+    bucket = bucket_from_score(score)
+    bucket_emoji = score_to_emoji(bucket)
+
+    # -----------------------------
+    # Header cards
+    # -----------------------------
+    st.subheader("נ“ ׳¡׳˜׳˜׳•׳¡ ׳׳¢׳¨׳›׳×")
+    c1, c2, c3 = st.columns([1.2, 1, 2])
+    with c1:
+        st.success("ג… ׳₪׳¢׳™׳")
+    with c2:
+        st.write(f"נ• {now_str()}")
+    with c3:
+        st.info("ג… BTC: Binance | Premium: Coinbase | Macro: Stooq | Sentiment: Alternative.me")
+
+    st.divider()
+
+    # Top line metrics like the mockup
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("נ’° BTC-USD", f"${btc_price:,.2f}", f"{btc_chg_pct:+.2f}%")
+        st.caption(f"Binance 24h change: {btc_chg:+.2f}")
+    with m2:
+        # premium
+        premium_label = "נ¢" if premium_pct > 0 else "נ”´" if premium_pct < 0 else "ג×"
+        st.metric("נ”´ Coinbase Premium", f"{premium_pct:+.2f}%", "Coinbase - Binance")
+        st.caption(f"{premium_label} Coinbase price: ${cb_price:,.2f}")
+    with m3:
+        st.metric("נ˜± Fear & Greed", f"{fng_val}", f"{fng_cls}")
+        st.caption("Alternative.me")
+
+    m4, m5, m6 = st.columns(3)
+    with m4:
+        st.metric("נ“ VIX", f"{vix:,.2f}", "Daily (Stooq)")
+    with m5:
+        st.metric("נ’µ DXY", f"{dxy:,.2f}", "USD_I (Stooq)")
+    with m6:
+        st.metric("נ¥‡ Gold / נ¥ˆ Silver", f"{gold:,.2f} / {silver:,.2f}", "XAUUSD / XAGUSD (Stooq)")
+
+    st.divider()
+
+    # Signal block
+    st.subheader(f"{bucket_emoji} ׳׳™׳×׳•׳×: {bucket.replace('_',' ')}")
+    st.write(f"**׳¦׳™׳•׳:** {score}/100")
+
+    # Detailed bullets
+    st.subheader("נ“‹ ׳ ׳™׳×׳•׳— ׳׳₪׳•׳¨׳˜")
+    for it in items:
+        sign = "ג•" if it.points > 0 else "ג–" if it.points < 0 else "ג€¢"
+        st.write(f"{sign} **{it.name}**: {it.detail} ({it.points:+d})")
+
+    st.divider()
+
+    # Charts
+    left, right = st.columns([2.2, 1])
+    with left:
+        st.subheader("נ“ˆ BTC Close")
+        st.line_chart(df_btc["Close"])
+        st.subheader("נ§¾ BTC candles (tail)")
+        st.dataframe(df_btc.tail(80), use_container_width=True)
+
+    with right:
+        st.subheader("נ“ Score table")
+        df_items = pd.DataFrame([{"Factor": x.name, "Points": x.points, "Details": x.detail} for x in items])
+        st.dataframe(df_items, use_container_width=True, height=340)
+
+        st.subheader("נ“± Telegram")
+        send_now = st.button("נ“± ׳©׳׳— ׳”׳×׳¨׳׳” ׳׳˜׳׳’׳¨׳", use_container_width=True)
+        if send_now:
+            if not tg_token or not tg_chat:
+                st.warning("׳—׳¡׳¨׳™׳ BOT TOKEN / CHAT ID")
+            else:
+                msg = (
+                    f"QUANT WAR ROOM\n"
+                    f"BTC: ${btc_price:,.2f} ({btc_chg_pct:+.2f}%)\n"
+                    f"Score: {score} ג†’ {bucket}\n"
+                    f"Premium: {premium_pct:+.2f}% | F&G: {fng_val} ({fng_cls}) | VIX: {vix:.2f} | DXY: {dxy:.2f}"
+                )
+                ok = telegram_send(tg_token, tg_chat, msg)
+                st.success("׳ ׳©׳׳— ג…" if ok else "׳ ׳›׳©׳ ג")
+
+    # Auto-alert on threshold cross (bucket-based guard)
+    if tg_token and tg_chat:
+        if score >= alert_pos:
+            desired_bucket = "POS"
+        elif score <= alert_neg:
+            desired_bucket = "NEG"
+        else:
+            desired_bucket = None
+
+        if desired_bucket and st.session_state["last_alert_bucket"] != desired_bucket:
+            msg = (
+                f"נ¨ AUTO ALERT\n"
+                f"BTC: ${btc_price:,.2f} ({btc_chg_pct:+.2f}%)\n"
+                f"Score: {score} ג†’ {bucket}\n"
+                f"Premium: {premium_pct:+.2f}% | F&G: {fng_val} ({fng_cls}) | VIX: {vix:.2f} | DXY: {dxy:.2f}"
+            )
+            ok = telegram_send(tg_token, tg_chat, msg)
+            st.session_state["last_alert_bucket"] = desired_bucket if ok else st.session_state["last_alert_bucket"]
+
+except Exception:
+    st.error("ג ׳׳ ׳ ׳™׳×׳ ׳׳˜׳¢׳•׳ ׳ ׳×׳•׳ ׳™׳. ׳ ׳¡׳” ׳©׳•׳‘ ׳׳׳•׳—׳¨ ׳™׳•׳×׳¨.")
+    if show_debug:
+        st.code(traceback.format_exc())
+
+# Auto refresh
+if auto_refresh:
+    time.sleep(int(refresh_sec))
+    st.rerun()

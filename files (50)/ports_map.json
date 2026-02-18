@@ -1,0 +1,20 @@
+[
+  {
+    "name": "ELITE_v20",
+    "file": "elite_v20_dashboard.py",
+    "port": 8510,
+    "url": "http://127.0.0.1:8510"
+  },
+  {
+    "name": "DUDU_BONUS",
+    "file": "dudu_progression_dashboard.py",
+    "port": 8511,
+    "url": "http://127.0.0.1:8511"
+  },
+  {
+    "name": "MULTI_TF",
+    "file": "multi_timeframe_dashboard.py",
+    "port": 8512,
+    "url": "http://127.0.0.1:8512"
+  }
+]

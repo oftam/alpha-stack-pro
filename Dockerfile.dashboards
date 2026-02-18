@@ -1,0 +1,29 @@
+FROM python:3.11-slim
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Working directory
+WORKDIR /app
+
+# Install Python dependencies first (cache layer)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all project files
+COPY . .
+
+# Set UTF-8 encoding globally
+ENV PYTHONIOENCODING=utf-8
+ENV LANG=C.UTF-8
+
+# Expose ports for 3 dashboards
+EXPOSE 8510 8511 8512
+
+# Health check
+HEALTHCHECK CMD curl -f http://localhost:8510/_stcore/health || exit 1
+
+# Entry: launch all 3 dashboards
+CMD ["python", "_RUN_THIS/launcher_today_working.py"]

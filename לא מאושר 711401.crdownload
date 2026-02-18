@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+# ============================================================
+# STREAMLIT DASHBOARD – Alpha Stack Pro Live Monitor
+# ============================================================
+# Run with: streamlit run dashboard.py
+# Auto-refreshes every 30 sec
+# ============================================================
+
+import streamlit as st
+import sqlite3
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+from pathlib import Path
+
+st.set_page_config(page_title="ALPHA STACK PRO", layout="wide", initial_sidebar_state="expanded")
+
+# Auto-refresh
+st.markdown("""
+<script>
+    const interval = setInterval(() => location.reload(), 30000);
+</script>
+""", unsafe_allow_html=True)
+
+DB_PATH = Path("data/alpha_stack.db")
+
+@st.cache_resource
+def get_db_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown("# 📈 ALPHA STACK PRO – Production Dashboard")
+st.markdown(f"🔄 Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Auto-refresh: 30sec")
+
+# ============================================================
+# TABS
+# ============================================================
+
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Latest Signal", "📈 Equity Curve", "📋 Recent Trades", "📉 Stats"])
+
+# ============================================================
+# TAB 1: Latest Signal
+# ============================================================
+
+with tab1:
+    try:
+        conn = get_db_conn()
+        latest_sig = pd.read_sql("""
+            SELECT * FROM signals ORDER BY date DESC LIMIT 1
+        """, conn)
+        
+        if len(latest_sig) > 0:
+            sig = latest_sig.iloc[0]
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            # Signal
+            signal_color = "🟢" if sig['signal'] == 'BUY' else "🔴" if sig['signal'] == 'SELL' else "⚪"
+            col1.metric(
+                "Signal",
+                f"{signal_color} {sig['signal']}",
+                f"Conf: {sig['confidence']:.2%}" if pd.notna(sig['confidence']) else "N/A"
+            )
+            
+            # Probabilities
+            col2.metric(
+                "P(UP)",
+                f"{sig['p_up']:.2%}",
+                f"vs P(DOWN)={sig['p_down']:.2%}"
+            )
+            
+            # Regime
+            col3.metric(
+                "Regime",
+                "🐂 BULL" if sig['regime'] == 'BULL' else "🐻 BEAR",
+                "Extreme" if sig['extreme_bull'] else "Normal"
+            )
+            
+            # Expected Value
+            col4.metric(
+                "Expected Value",
+                f"{sig['ev']:.4f}",
+                "Positive ✓" if sig['ev'] > 0 else "Negative ✗"
+            )
+            
+            # Details
+            st.markdown("---")
+            st.write(f"**Date:** {sig['date']}")
+            st.write(f"**Vol Target:** {sig['vol_target']:.4f}")
+            st.write(f"**Tail Risk (CVaR 5%):** {sig['tail_risk']:.4f}" if pd.notna(sig['tail_risk']) else "N/A")
+            
+        else:
+            st.warning("No signals generated yet. Run production_engine.py first!")
+    except Exception as e:
+        st.error(f"Error loading signals: {e}")
+
+# ============================================================
+# TAB 2: Equity Curve
+# ============================================================
+
+with tab2:
+    try:
+        conn = get_db_conn()
+        trades = pd.read_sql("""
+            SELECT * FROM trades ORDER BY exit_date
+        """, conn)
+        
+        if len(trades) > 0:
+            # Equity curve
+            fig = go.Figure()
+            
+            equity = trades['equity'].values
+            dates = pd.to_datetime(trades['exit_date']).values
+            
+            fig.add_trace(go.Scatter(
+                x=dates, y=equity,
+                mode='lines+markers',
+                name='Equity',
+                line=dict(color='#1f77b4', width=3),
+                marker=dict(size=6),
+                fill='tozeroy',
+                fillcolor='rgba(31, 119, 244, 0.1)'
+            ))
+            
+            # Max equity drawdown
+            running_max = np.maximum.accumulate(equity)
+            drawdown = (equity - running_max) / running_max * 100
+            
+            fig.add_trace(go.Scatter(
+                x=dates, y=drawdown,
+                mode='lines',
+                name='Drawdown %',
+                line=dict(color='rgba(255, 0, 0, 0.5)', width=2, dash='dash'),
+                yaxis='y2'
+            ))
+            
+            fig.update_layout(
+                title="Equity Curve & Drawdown",
+                xaxis_title="Date",
+                yaxis_title="Equity ($)",
+                yaxis2=dict(title="Drawdown (%)", overlaying="y", side="right"),
+                hovermode='x unified',
+                height=600
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No trades yet. Check signals.")
+            
+    except Exception as e:
+        st.error(f"Error loading equity curve: {e}")
+
+# ============================================================
+# TAB 3: Recent Trades
+# ============================================================
+
+with tab3:
+    try:
+        conn = get_db_conn()
+        trades = pd.read_sql("""
+            SELECT entry_date, exit_date, entry_price, exit_price, 
+                   pnl_pct, position_pct, exit_reason
+            FROM trades ORDER BY exit_date DESC LIMIT 20
+        """, conn)
+        
+        if len(trades) > 0:
+            trades['entry_date'] = pd.to_datetime(trades['entry_date']).dt.strftime('%Y-%m-%d')
+            trades['exit_date'] = pd.to_datetime(trades['exit_date']).dt.strftime('%Y-%m-%d')
+            trades['entry_price'] = trades['entry_price'].apply(lambda x: f"${x:,.2f}")
+            trades['exit_price'] = trades['exit_price'].apply(lambda x: f"${x:,.2f}")
+            trades['pnl_pct'] = trades['pnl_pct'].apply(lambda x: f"{x:.2%}")
+            trades['position_pct'] = trades['position_pct'].apply(lambda x: f"{x:.2%}")
+            
+            st.dataframe(trades, use_container_width=True)
+        else:
+            st.info("No trades yet.")
+            
+    except Exception as e:
+        st.error(f"Error loading trades: {e}")
+
+# ============================================================
+# TAB 4: Stats
+# ============================================================
+
+with tab4:
+    try:
+        conn = get_db_conn()
+        stats = pd.read_sql("""
+            SELECT * FROM backtest_stats ORDER BY run_date DESC LIMIT 1
+        """, conn)
+        
+        if len(stats) > 0:
+            s = stats.iloc[0]
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Return", f"{s['total_return']:.2%}")
+            col2.metric("Win Rate", f"{s['win_rate']:.2%}")
+            col3.metric("Sharpe Ratio", f"{s['sharpe']:.2f}")
+            col4.metric("Max Drawdown", f"{s['max_dd']:.2%}")
+            
+            col5, col6, col7 = st.columns(3)
+            col5.metric("Trades", int(s['num_trades']))
+            col6.metric("Final Equity", f"${s['final_equity']:,.0f}")
+            col7.metric("Run Date", pd.to_datetime(s['run_date']).strftime('%Y-%m-%d'))
+            
+        else:
+            st.info("No backtest stats yet. Run backtest_engine.py first!")
+            
+    except Exception as e:
+        st.error(f"Error loading stats: {e}")
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
+st.markdown("""
+**Alpha Stack Pro – Production System**  
+🔄 Auto-refresh: 30 seconds  
+📊 Data: SQLite database  
+🚀 Ready for 24/7 trading
+""")

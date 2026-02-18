@@ -1,0 +1,23 @@
+# ============================================
+# ELITE v20 - Streamlit Cloud Dependencies
+# ============================================
+
+# Core
+streamlit>=1.30.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+
+# AI
+google-generativeai>=0.3.0
+
+# Crypto Data
+ccxt>=4.0.0
+requests>=2.31.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Memory System (optional)
+# supabase>=2.0.0
+# cohere>=4.0.0
