@@ -96,6 +96,9 @@ AUDIT_FIELDS = [
     "conviction",
     "final_action",
     "onchain_signal",
+    "diffusion_score",
+    "fear_greed",
+    "manifold_score",
     "chaos_class",
     "gates_allow_trade",
 ]
@@ -108,6 +111,10 @@ def append_elite_audit_row(df: pd.DataFrame, elite_results: dict, symbol: str, i
     except Exception:
         return  # no data, nothing to log
 
+    onchain = elite_results.get("onchain", {})
+    fg_data = onchain.get("fear_greed", {})
+    fg_value = fg_data.get("value", 50) if isinstance(fg_data, dict) else 50
+
     row = {
         "timestamp_utc": ts.isoformat(),
         "symbol": symbol,
@@ -118,7 +125,10 @@ def append_elite_audit_row(df: pd.DataFrame, elite_results: dict, symbol: str, i
         "system_confidence": float(elite_results.get("confidence", 0.0)),
         "conviction": float(elite_results.get("conviction", 0.0)),
         "final_action": elite_results.get("final_action", "NA"),
-        "onchain_signal": elite_results.get("onchain", {}).get("signal", "NA"),
+        "onchain_signal": onchain.get("signal", "NA"),
+        "diffusion_score": float(onchain.get("diffusion_score", 0.0)),
+        "fear_greed": int(fg_value),
+        "manifold_score": float(elite_results.get("manifold", {}).get("score", 0.0)),
         "chaos_class": elite_results.get("chaos", {}).get("classification", "NA"),
         "gates_allow_trade": bool(elite_results.get("gates", {}).get("allow_trade", True)),
     }
