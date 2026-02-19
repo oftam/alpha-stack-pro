@@ -136,6 +136,69 @@ class EliteMobileNotifier:
 """
         return self.send_message(msg.strip())
     
+    def check_sniper_trigger(self, elite_results: dict, fear_greed: int) -> bool:
+        """
+        Check if all 4 SNIPER EXECUTION conditions are met.
+        
+        Returns True if trigger fires (sends Telegram alert automatically).
+        
+        Conditions:
+          1. Fear & Greed <= 15  (macro discount window open)
+          2. OnChain == STRONG_ACCUMULATION  (whales still backing)
+          3. Book Imbalance >= -0.20  (sell wall absorbed)
+          4. TRUECVD >= 0.0  (buyers attacking aggressively)
+        """
+        try:
+            onchain = elite_results.get('onchain', {})
+            protein = elite_results.get('protein', {})
+            
+            onchain_signal = onchain.get('signal', '')
+            book_imbalance = float(protein.get('book_imbalance', -999))
+            truecvd = float(protein.get('cvd_delta', protein.get('truecvd', -999)))
+            
+            cond1 = fear_greed <= 15
+            cond2 = onchain_signal == 'STRONG_ACCUMULATION'
+            cond3 = book_imbalance >= -0.20
+            cond4 = truecvd >= 0.0
+            
+            if cond1 and cond2 and cond3 and cond4:
+                self.alert_sniper_execution_trigger(
+                    fear_greed=fear_greed,
+                    onchain_signal=onchain_signal,
+                    book_imbalance=book_imbalance,
+                    truecvd=truecvd,
+                    elite_score=float(elite_results.get('elite_score', 0))
+                )
+                return True
+            return False
+        except Exception as e:
+            print(f"⚠️ Sniper trigger check error: {e}")
+            return False
+
+    def alert_sniper_execution_trigger(self, fear_greed: int, onchain_signal: str,
+                                        book_imbalance: float, truecvd: float,
+                                        elite_score: float) -> bool:
+        """
+        🔥 URGENT: SNIPER EXECUTION TRIGGER
+        Fires when microstructure reversal confirms Fear extreme.
+        All 4 conditions must be met simultaneously.
+        """
+        msg = f"""🔥 <b>URGENT: SNIPER EXECUTION TRIGGER</b> 🔥
+
+✅ ALL 4 CONDITIONS MET — EXECUTE NOW
+
+1️⃣ Fear &amp; Greed: <b>{fear_greed}/100</b> (Extreme Fear ✅)
+2️⃣ OnChain: <b>{onchain_signal}</b> (Whales buying ✅)
+3️⃣ Book Imbalance: <b>{book_imbalance:+.3f}</b> (Sell wall gone ✅)
+4️⃣ TRUECVD: <b>{truecvd:+.2f}</b> (Buyers attacking ✅)
+
+📊 Elite Score: <b>{elite_score:.0f}/100</b>
+🕐 Time: {datetime.now().strftime('%H:%M:%S')}
+
+⚡ <b>HOLD → EXECUTE. This is the signal.</b>
+<i>Execute within 15 minutes for optimal entry.</i>"""
+        return self.send_message(msg.strip())
+
     def daily_summary(self, data: Dict[str, Any]) -> bool:
         """
         📊 ELITE v20 - Daily Briefing (Smart Format)

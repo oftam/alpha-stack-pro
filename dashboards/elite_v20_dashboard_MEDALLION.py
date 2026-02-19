@@ -500,6 +500,19 @@ def main():
             # AUDIT LOG — for 60-day backtest
             if elite_results:
                 append_audit_row(current_price, elite_results, symbol)
+                
+                # SNIPER EXECUTION TRIGGER — fires Telegram when all 4 conditions met
+                if mobile_notifier and MOBILE_AVAILABLE:
+                    try:
+                        onchain = elite_results.get('onchain', {})
+                        fg_data = onchain.get('fear_greed', {})
+                        fg_val = int(fg_data.get('value', 50)) if isinstance(fg_data, dict) else 50
+                        triggered = mobile_notifier.check_sniper_trigger(elite_results, fg_val)
+                        if triggered:
+                            st.error("🔥 SNIPER EXECUTION TRIGGER FIRED — Check Telegram!")
+                    except Exception as e:
+                        pass  # Never crash dashboard for trigger check
+
             
             # AUTO-LOG SIGNAL TO MEMORY SYSTEM
             if memory_logger and MEMORY_AVAILABLE and elite_results:
