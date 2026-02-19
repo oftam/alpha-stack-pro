@@ -65,7 +65,9 @@ class FinalArbiter:
         
         onchain = elite_results.get('onchain', {})
         diffusion_score = onchain.get('diffusion_score', 50)
-        fg_index = onchain.get('fear_greed_index', 50)
+        # Fear & Greed comes as nested dict {'value': X, 'classification': ...}
+        fg_data = onchain.get('fear_greed', {})
+        fg_index = fg_data.get('value', 50) if isinstance(fg_data, dict) else 50
         
         stabilizer = elite_results.get('stabilized', {})
         validation = stabilizer.get('validation_periods', 0) if stabilizer else 0
