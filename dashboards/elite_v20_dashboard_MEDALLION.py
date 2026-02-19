@@ -587,7 +587,7 @@ def main():
             'WAIT': '⚪'
         }.get(final_action, '⚪')
         
-        st.markdown(f'<div class="regime-normal">{action_color} Commander\'s Call: **{final_action}**</div>', 
+        st.markdown(f'<div class="regime-normal">{action_color} החלטה הסופית: **{final_action}**</div>', 
                    unsafe_allow_html=True)
     
     st.markdown("---")
