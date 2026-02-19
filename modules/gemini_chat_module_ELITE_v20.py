@@ -201,8 +201,12 @@ class EliteGeminiChat:
             if 'tactical' in signals:
                 tact_sig = signals['tactical']
                 context_parts.append(f"\nTactical Signal: {tact_sig.get('direction', 'NO_SIGNAL')}")
-                if tact_sig.get('confidence'):
-                    context_parts.append(f"  Confidence: {tact_sig['confidence']:.1f}%")
+                if tact_sig.get('confidence') is not None:
+                    conf_val = tact_sig['confidence']
+                    # If stored as decimal (0.0-1.0), convert to percentage
+                    if conf_val <= 1.0:
+                        conf_val = conf_val * 100
+                    context_parts.append(f"  Confidence: {conf_val:.0f}%")
                 if tact_sig.get('suggested_size'):
                     context_parts.append(f"  Suggested Size: ${tact_sig['suggested_size']:,.0f}")
             
