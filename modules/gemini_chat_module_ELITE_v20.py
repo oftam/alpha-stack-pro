@@ -275,6 +275,8 @@ class EliteGeminiChat:
 - OnChain Diffusion: 0-100
 - Manifold DNA: 0-100
 - Chaos/Violence: נמוך = שוק רגוע (טוב)
+- system_confidence: ערך עשרוני 0.0–1.0 — הצג כאחוזים! (1.0 = 100%, לא 1%)
+  דוגמה: confidence=1.0 → "ביטחון: 100%" לא "ביטחון: 1%"
 
 מה כן לעשות:
 1. ענה בעברית ברורה
