@@ -158,33 +158,6 @@ class EliteGeminiChat:
             context_parts.append(f"Volume: {market.get('volume', 0):,.0f}")
             context_parts.append("")
         
-        # Portfolio Status
-        if 'portfolio' in dashboard_data:
-            portfolio = dashboard_data['portfolio']
-            context_parts.append("## PORTFOLIO STATUS")
-            
-            if 'capital' in portfolio:
-                cap = portfolio['capital']
-                context_parts.append(f"Total Capital: ${cap.get('total_value', 0):,.2f}")
-                context_parts.append(f"Available: ${cap.get('available', 0):,.2f}")
-                context_parts.append(f"Deployed: ${cap.get('deployed', 0):,.2f}")
-            
-            if 'dca' in portfolio:
-                dca = portfolio['dca']
-                context_parts.append(f"\nDCA Strategy (60%):")
-                context_parts.append(f"  BTC Held: {dca.get('btc_held', 0):.4f}")
-                context_parts.append(f"  Avg Entry: ${dca.get('avg_entry', 0):,.0f}")
-                context_parts.append(f"  Unrealized P&L: ${dca.get('unrealized_pnl', 0):,.2f}")
-            
-            if 'tactical' in portfolio:
-                tact = portfolio['tactical']
-                context_parts.append(f"\nTactical Strategy (40%):")
-                context_parts.append(f"  Active Positions: {tact.get('active_positions', 0)}")
-                context_parts.append(f"  Total P&L: ${tact.get('total_pnl', 0):,.2f}")
-                context_parts.append(f"  Win Rate: {tact.get('win_rate', 0):.1f}%")
-            
-            context_parts.append("")
-        
         # Signals
         if 'signals' in dashboard_data:
             signals = dashboard_data['signals']
