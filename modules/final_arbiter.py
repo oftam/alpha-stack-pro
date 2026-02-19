@@ -206,7 +206,7 @@ class FinalArbiter:
         
         lines = []
         lines.append("=" * 60)
-        lines.append("🎖️  FINAL DECISION - COMMANDER'S CALL")
+        lines.append("🎯  FINAL DECISION")
         lines.append("=" * 60)
         
         # Action line
