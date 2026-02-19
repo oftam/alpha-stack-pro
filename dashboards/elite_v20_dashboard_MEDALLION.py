@@ -244,6 +244,16 @@ def start_sentinel_daemon():
                     manifold_score = results.get('elite_score', 0)
                     diffusion_score = results.get('onchain', {}).get('diffusion_score', 50)
                     
+                    # Fetch real Fear & Greed for Sentinel (no st.cache)
+                    try:
+                        import requests as req
+                        fg_resp = req.get("https://api.alternative.me/fng/", timeout=10)
+                        fg_value = int(fg_resp.json()['data'][0]['value'])
+                    except Exception:
+                        fg_value = 50  # fallback only on error
+                    
+                    fg_label = "Extreme Fear" if fg_value < 20 else "Fear" if fg_value < 40 else "Neutral" if fg_value < 60 else "Greed" if fg_value < 80 else "Extreme Greed"
+                    
                     # Prepare Data
                     alert_data = {
                         'action': current_action,
@@ -253,8 +263,8 @@ def start_sentinel_daemon():
                         'dna': round(manifold_score, 1),
                         'div_label': "BULLISH" if diffusion_score > 60 else "BEARISH" if diffusion_score < 40 else "NEUTRAL",
                         'div_score': round(diffusion_score, 1),
-                        'sentiment': 50,
-                        'sent_label': "Neutral",
+                        'sentiment': fg_value,
+                        'sent_label': fg_label,
                         'strategy_hint': f"Regime: {results.get('chaos', {}).get('regime', 'NORMAL')}"
                     }
                     
