@@ -19,8 +19,48 @@ import numpy as np
 import sys
 import os
 import importlib
+import csv
 from datetime import datetime
 from pathlib import Path
+
+# ============================================================================
+# AUDIT LOG — Records every analysis for future backtest
+# ============================================================================
+AUDIT_PATH = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "elite_audit_log.csv"
+AUDIT_FIELDS = [
+    "timestamp_utc", "symbol", "price", "elite_score", "confidence",
+    "final_action", "diffusion_score", "fear_greed", "manifold_score",
+    "onchain_signal", "chaos_class", "gates_allow_trade",
+]
+
+def append_audit_row(price: float, elite_results: dict, symbol: str = "BTCUSDT"):
+    """Append one audit row per Elite evaluation for future backtest."""
+    try:
+        onchain = elite_results.get("onchain", {})
+        fg_data = onchain.get("fear_greed", {})
+        fg_value = fg_data.get("value", 50) if isinstance(fg_data, dict) else 50
+        row = {
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "price": price,
+            "elite_score": float(elite_results.get("elite_score_adjusted", elite_results.get("elite_score", 0))),
+            "confidence": float(elite_results.get("confidence", 0)),
+            "final_action": elite_results.get("final_action", "NA"),
+            "diffusion_score": float(onchain.get("diffusion_score", 0)),
+            "fear_greed": int(fg_value),
+            "manifold_score": float(elite_results.get("manifold", {}).get("score", 0)),
+            "onchain_signal": onchain.get("signal", "NA"),
+            "chaos_class": elite_results.get("chaos", {}).get("classification", "NA"),
+            "gates_allow_trade": bool(elite_results.get("gates", {}).get("allow_trade", True)),
+        }
+        file_exists = AUDIT_PATH.exists()
+        with AUDIT_PATH.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=AUDIT_FIELDS)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception:
+        pass  # Never crash dashboard for logging
 
 # Add paths for module imports
 # Dashboard is in dashboards/ - need to go up one level to root
@@ -456,6 +496,10 @@ def main():
                 df=df,
                 exposure_pct=15.0  # default exposure
             )
+            
+            # AUDIT LOG — for 60-day backtest
+            if elite_results:
+                append_audit_row(current_price, elite_results, symbol)
             
             # AUTO-LOG SIGNAL TO MEMORY SYSTEM
             if memory_logger and MEMORY_AVAILABLE and elite_results:
