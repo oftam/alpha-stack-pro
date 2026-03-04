@@ -1,10 +1,169 @@
 # dudu_overlay.py
 # DUDU Overlay V0: Vol Cone + Regime Paths (bootstrap from similar regimes)
+# + Spectral Divergence Engine (Classical FFT — Medallion Brain)
 from __future__ import annotations
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+# ============================================================================
+# SPECTRAL DIVERGENCE ENGINE
+# ============================================================================
+# The FFT input MUST be the divergence signal — the gap between price action
+# and on-chain/whale fundamentals (diffusion score). Running FFT on raw close
+# prices gives retail frequency noise; running it on the divergence gap
+# extracts whale-cycle resonance frequencies. (The Spectral Rule)
+
+def compute_divergence_eigenvalue(divergence_series) -> dict:
+    """
+    Classical Spectral Decomposition of the Whale-Gap Divergence signal.
+    
+    Input: divergence_series — the gap between price and on-chain score.
+           Can be a list, np.ndarray, or pd.Series.
+           Typically: (close - close.rolling(N).mean()) * (diffusion_score/100)
+           or simply the raw diffusion_score series over time.
+    
+    Returns: {eigenvalue, dominant_freq, amplitude, tension, fft_power}
+    
+    Eigenvalue maps to a drift multiplier for DUDU cone:
+      1.00 = neutral (no spectral pressure)
+      1.10 = MEDIUM tension (moderate whale cycle detected)  
+      1.25 = HIGH tension (strong resonance — tighten P10 floor)
+    """
+    try:
+        from scipy.fft import fft as scipy_fft
+        _fft = scipy_fft
+    except ImportError:
+        _fft = np.fft.fft  # fallback to numpy FFT
+
+    # Coerce input
+    if isinstance(divergence_series, pd.Series):
+        signal = divergence_series.dropna().astype(float).values
+    elif isinstance(divergence_series, (list, tuple)):
+        signal = np.array(divergence_series, dtype=float)
+        signal = signal[np.isfinite(signal)]
+    else:
+        signal = np.asarray(divergence_series, dtype=float)
+        signal = signal[np.isfinite(signal)]
+
+    # Not enough data → neutral eigenvalue
+    if len(signal) < 8:
+        return {
+            "eigenvalue": 1.0,
+            "dominant_freq": 0,
+            "amplitude": 0.0,
+            "tension": "LOW",
+            "fft_power": [],
+        }
+
+    # Normalize: zero-mean, unit-range (avoids DC bias dominating FFT)
+    rng = np.ptp(signal)
+    if rng > 1e-10:
+        signal = (signal - signal.mean()) / (rng / 2.0)
+    else:
+        # Flat signal → no resonance
+        return {
+            "eigenvalue": 1.0,
+            "dominant_freq": 0,
+            "amplitude": 0.0,
+            "tension": "LOW",
+            "fft_power": [],
+        }
+
+    # FFT — only positive frequencies (one-sided spectrum)
+    freqs = _fft(signal)
+    n = len(freqs)
+    power = np.abs(freqs[: n // 2])
+
+    # Skip DC component (index 0 = constant offset, not a cycle)
+    power_ac = power[1:]
+    dominant_idx = int(np.argmax(power_ac)) + 1  # +1 to restore absolute index
+    dominant_amplitude = float(power_ac[dominant_idx - 1] / len(signal))
+
+    # Map amplitude → eigenvalue (1.0 to 1.25 range)
+    eigenvalue = float(np.clip(1.0 + dominant_amplitude * 0.5, 1.0, 1.25))
+
+    # Tension tier
+    if dominant_amplitude > 0.4:
+        tension = "HIGH"
+    elif dominant_amplitude > 0.2:
+        tension = "MEDIUM"
+    else:
+        tension = "LOW"
+
+    return {
+        "eigenvalue": round(eigenvalue, 4),
+        "dominant_freq": dominant_idx,
+        "amplitude": round(dominant_amplitude, 4),
+        "tension": tension,
+        "fft_power": power_ac.tolist(),  # full power spectrum for charting
+    }
+
+
+def apply_spectral_boost(cone_result: dict, eigenvalue: float) -> dict:
+    """
+    Injects the Spectral Eigenvalue into the DUDU vol cone result.
+    
+    Tightens (boosts) the P10 floor: a higher eigenvalue means stronger
+    whale-cycle support, so the downside floor rises.
+    
+    cone_result: output dict from build_vol_cone()
+    eigenvalue:  float from compute_divergence_eigenvalue() — 1.0 to 1.25
+    
+    Returns: augmented cone_result with 'spectral_p10_boost' and 
+             'eigenvalue' keys added.
+    """
+    if not cone_result or "last" not in cone_result:
+        return cone_result
+
+    last = cone_result["last"]
+    bands = cone_result.get("bands", {})
+
+    # Boost P10 (1σ lower band at horizon): floor rises by eigenvalue factor
+    boosted_bands = {}
+    for s, (dn, up) in bands.items():
+        # Upper band unchanged; lower band raised by spectral pressure
+        boosted_dn = dn * eigenvalue  # eigenvalue ≥ 1.0 → floor rises
+        boosted_up = up               # upside unchanged
+        boosted_bands[s] = (boosted_dn, boosted_up)
+
+    # Concrete P10 floor at the end of the horizon
+    if 1 in boosted_bands:
+        p10_floor_boosted = float(boosted_bands[1][0][-1])
+    else:
+        p10_floor_boosted = None
+
+    return {
+        **cone_result,
+        "bands": boosted_bands,
+        "eigenvalue": eigenvalue,
+        "p10_floor_boosted": p10_floor_boosted,
+        "spectral_boost_applied": True,
+    }
+
+
+# ─── helper to build divergence series from OHLCV + diffusion score ──────────
+def build_divergence_series(close: pd.Series, diffusion_score: float,
+                             window: int = 20) -> pd.Series:
+    """
+    Constructs the whale-gap divergence series from price data and the
+    current on-chain diffusion score.
+    
+    Formula: divergence = z-score(close, window) * (diffusion_score / 100)
+    
+    - z-score(close): normalised price deviation from recent mean
+    - diffusion_score factor: scales signal by on-chain conviction strength
+    
+    This means:
+      - When diffusion is 80 (bullish) and price is above MA → strong positive divergence
+      - When diffusion is 20 (bearish) and price is above MA → muted divergence (whale sell pressure)
+    """
+    roll_mean = close.rolling(window, min_periods=5).mean()
+    roll_std  = close.rolling(window, min_periods=5).std().replace(0, np.nan)
+    z_score   = (close - roll_mean) / roll_std
+    divergence = z_score * (diffusion_score / 100.0)
+    return divergence.fillna(0.0)
 
 def _safe_float(x, default=np.nan):
     try:
@@ -17,46 +176,102 @@ def _ensure_returns(close: pd.Series) -> pd.Series:
     r = close.pct_change()
     return r.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
+def _ewma_sigma(returns: np.ndarray, lam: float = 0.94) -> float:
+    """
+    RiskMetrics EWMA Variance: σ²_t = λ·σ²_{t-1} + (1-λ)·r²_t
+    Gives exponential recency weighting so recent crashes dominate.
+    λ=0.94 is the JP Morgan / RiskMetrics industry standard for daily data.
+    """
+    if len(returns) < 2:
+        return 0.0
+    r = np.asarray(returns, dtype=float)
+    r = r[np.isfinite(r)]
+    if len(r) < 2:
+        return 0.0
+    var = float(np.var(r[:5]))  # seed with first-5-bar variance
+    for rt in r[5:]:
+        var = lam * var + (1.0 - lam) * rt ** 2
+    return float(np.sqrt(max(var, 0.0)))
+
+# ─── Regime strings that warrant an expanded cone ───────────────────────────
+_VOLATILE_REGIMES = {
+    "VOLATILE", "CHAOS_SPIKE", "BLOOD_IN_STREETS",
+    "BLOOD", "CAPITULATION", "CRASH", "EXTREME_FEAR",
+    "WHITE_NOISE", "WHIPSAW",
+}
+
 def build_vol_cone(close: pd.Series, horizon: int = 48, lookback: int = 240,
-                   sigmas=(1, 2), mode: str = "sqrt_time", current_violence: float = 1.0):
+                   sigmas=(1, 2), mode: str = "sqrt_time",
+                   current_violence: float = 1.0,
+                   current_regime: str | None = None):
     """
     Returns dict with bands: {sigma: (lower, upper)} arrays length horizon+1
-    Input current_violence: Multiplier for chaos adjustment (1.0 = normal).
+
+    Adaptive Sigma (3-layer):
+    1. EWMA λ=0.94 — exponential recency weighting (RiskMetrics standard).
+       Recent day crash weights 30× more than a quiet bar 90 days ago.
+    2. Dynamic sigma lookback — 90–180 bars (recent vol, NOT full history).
+       Full lookback is still used by build_regime_paths for bootstrap diversity.
+    3. Regime-Conditional Multiplier — automatically widens cone in volatile regimes:
+       VOLATILE / CHAOS_SPIKE / BLOOD_IN_STREETS → 2.0×–2.5× sigma expansion.
+
+    Input current_violence: Legacy chaos multiplier (1.0 = normal).
+    Input current_regime:   String from regime_detector, used for tier-3 multiplier.
     """
     close = close.dropna().astype(float)
-    if len(close) < max(lookback, 50):
-        lookback = max(50, len(close) - 1)
+    n = len(close)
 
-    r = _ensure_returns(close).tail(lookback)
-    sigma = float(np.nanstd(r.values, ddof=1)) if len(r) > 5 else 0.0
+    # ── Layer 2: Dynamic Lookback for sigma (90–180 bars recent, not full history) ──
+    sigma_lookback = max(90, min(180, n - 1))
+    r_sigma = _ensure_returns(close).tail(sigma_lookback)
+
+    # ── Layer 1: EWMA Sigma (exponentially weighted, λ=0.94) ────────────────────
+    sigma_ewma = _ewma_sigma(r_sigma.values, lam=0.94)
+
+    # Fallback: if EWMA gives 0 (degenerate input), use plain std over same window
+    if sigma_ewma < 1e-8:
+        sigma_ewma = float(np.nanstd(r_sigma.values, ddof=1)) if len(r_sigma) > 5 else 0.0
+
+    # ── Layer 3: Regime-Conditional Multiplier ───────────────────────────────────
+    regime_multiplier = 1.0
+    if current_regime is not None:
+        regime_upper = str(current_regime).upper()
+        if any(tag in regime_upper for tag in _VOLATILE_REGIMES):
+            # Scale with violence: baseline 2.0× up to 2.5× at violence ≥ 2.0
+            regime_multiplier = min(2.5, 2.0 + max(0.0, current_violence - 1.0) * 0.25)
+
+    # ── Legacy chaos adjustment (existing violence multiplier) ───────────────────
+    sensitivity = 0.5
+    violence_adjustment = 1.0
+    if current_violence > 1.0 and regime_multiplier == 1.0:
+        # Only apply legacy multiplier if regime multiplier didn't already kick in
+        violence_adjustment = min(3.0, 1.0 + (current_violence - 1.0) * sensitivity)
+
+    # Final sigma = EWMA × regime_multiplier × violence_adjustment
+    sigma = sigma_ewma  # raw EWMA (for reporting)
+    adjusted_sigma = sigma_ewma * regime_multiplier * violence_adjustment
+
     last = float(close.iloc[-1])
-
     t = np.arange(0, horizon + 1)
-    if mode == "sqrt_time":
-        scale = np.sqrt(t)
-    else:
-        scale = t
+    scale = np.sqrt(t) if mode == "sqrt_time" else t
 
     bands = {}
-    
-    # 🚀 Dynamic Chaos Adjustment: Calibration Protocol
-    # If violence > 1.0 (Chaos), expand the cone to contain kinetic energy
-    sensitivity = 0.5
-    adjustment = 1.0
-    if current_violence > 1.0:
-        adjustment = 1.0 + (current_violence - 1.0) * sensitivity
-        # Cap adjustment to prevent explosion (e.g., max 3x sigma)
-        adjustment = min(adjustment, 3.0)
-    
-    adjusted_sigma = sigma * adjustment
-
     for s in sigmas:
         spread = (adjusted_sigma * _safe_float(s, 1.0)) * scale
         up = last * (1.0 + spread)
         dn = last * (1.0 - spread)
         bands[int(s)] = (dn, up)
 
-    return {"last": last, "sigma": sigma, "adjusted_sigma": adjusted_sigma, "t": t, "bands": bands}
+    return {
+        "last": last,
+        "sigma": sigma,                          # EWMA sigma (raw, pre-multiplier)
+        "adjusted_sigma": adjusted_sigma,        # Final sigma used for cone width
+        "sigma_lookback": sigma_lookback,        # Actual bars used for EWMA
+        "regime_multiplier": regime_multiplier,  # Layer-3 regime expansion factor
+        "violence_adjustment": violence_adjustment,
+        "t": t,
+        "bands": bands,
+    }
 
 def _labels_to_str(labels) -> str:
     if labels is None:
@@ -134,7 +349,8 @@ def build_regime_paths(close: pd.Series,
 
 def render_projection_tab(st, df: pd.DataFrame, qc_payload: dict | None = None,
                           horizon: int = 48, current_regime: str | None = None,
-                          current_violence: float = 1.0):
+                          current_violence: float = 1.0,
+                          key: str = "dudu_base_chart"):
     """
     Streamlit renderer. Minimal dependencies: numpy, pandas.
     """
@@ -151,9 +367,10 @@ def render_projection_tab(st, df: pd.DataFrame, qc_payload: dict | None = None,
             codes = [codes]
         cur_regime = "|".join(sorted([str(x) for x in codes])) if codes else None
 
-    # Vol Cone (Present)
-    cone = build_vol_cone(close, horizon=horizon, lookback=min(240, len(close)-1), 
-                         sigmas=(1,2), current_violence=current_violence)
+    # Vol Cone (Present) — Adaptive Sigma (EWMA + Dynamic Lookback + Regime Multiplier)
+    cone = build_vol_cone(close, horizon=horizon, lookback=min(240, len(close)-1),
+                          sigmas=(1, 2), current_violence=current_violence,
+                          current_regime=cur_regime)
     
     # Regime Paths (Future)
     # Note: passing None for regime_series implies NO FILTERING currently.
@@ -174,8 +391,12 @@ def render_projection_tab(st, df: pd.DataFrame, qc_payload: dict | None = None,
         x=np.arange(-len(hist_tail)+1, 1),
         y=hist_tail.values,
         mode="lines",
-        name="History (tail)"
+        name="History (Price)",
+        line=dict(color="rgba(255,255,255,0.4)", width=1.5)
     ))
+    
+    # Vertical line separating Past from Future
+    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
 
     # shift future x-axis
     x_future = t
@@ -197,20 +418,32 @@ def render_projection_tab(st, df: pd.DataFrame, qc_payload: dict | None = None,
     fig.add_trace(go.Scatter(x=x_future, y=paths_obj["p10"], mode="lines", name="P10", line=dict(dash="dash")))
     fig.add_trace(go.Scatter(x=x_future, y=paths_obj["p90"], mode="lines", name="P90", line=dict(dash="dash")))
 
+    # Calculate Y-axis bounds to center everything nicely
+    y_min = min(hist_tail.min(), cone["bands"][2][0].min(), paths_obj["p10"].min())
+    y_max = max(hist_tail.max(), cone["bands"][2][1].max(), paths_obj["p90"].max())
+    padding = (y_max - y_min) * 0.05 # 5% buffer
+    
     fig.update_layout(
-        title="Projection (DUDU Overlay): Cone + Regime Paths",
+        title="🔮 Manifold Projection (DUDU Overlay)",
         xaxis_title="Bars ahead (0 = now)",
-        yaxis_title="Price",
+        yaxis_title="Price (USD)",
+        yaxis=dict(range=[y_min - padding, y_max + padding], gridcolor='rgba(255,255,255,0.05)'),
         height=520,
         margin=dict(l=10, r=10, t=40, b=10),
-        legend=dict(orientation="h")
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
     # 📉 Undersampling Fail-Safe Check
     num_windows = paths_obj['num_windows_used']
     if num_windows < 20:
         st.error(f"⚠️ LOW CONFIDENCE: Undersampling ({num_windows} windows < 20). FAIL-SAFE: Reduce Position Size (0.5x).")
 
-    st.caption(f"Windows used: {num_windows} | Cone sigma: {cone['sigma']:.6f} | Adj Sigma: {cone['adjusted_sigma']:.6f}")
+    st.caption(
+        f"Windows: {num_windows} | "
+        f"EWMA σ: {cone['sigma']:.6f} ({cone['sigma_lookback']}bars) | "
+        f"Adj σ: {cone['adjusted_sigma']:.6f} | "
+        f"Regime×: {cone['regime_multiplier']:.1f}× | "
+        f"Violence×: {cone['violence_adjustment']:.2f}×"
+    )
