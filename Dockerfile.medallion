@@ -1,0 +1,31 @@
+FROM python:3.11-slim
+
+# System deps for building and networking
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Working directory for institutional machine
+WORKDIR /app
+
+# Install Python dependencies (cached if requirements.txt unchanged)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy everything else (respecting .dockerignore)
+COPY . .
+
+# Global encoding for institutional stability
+ENV PYTHONIOENCODING=utf-8
+ENV LANG=C.UTF-8
+ENV STREAMLIT_SERVER_HEADLESS=true
+
+# GCP Cloud Run mandatory port
+EXPOSE 8080
+
+# Healthcheck for Cloud Run probes
+HEALTHCHECK CMD curl -f http://localhost:8080/_stcore/health || exit 1
+
+# Entry point: Deploying the Medallion Institutional Engine
+CMD ["streamlit", "run", "elite_v20_dashboard_MEDALLION.py", "--server.port", "8080", "--server.address", "0.0.0.0"]
