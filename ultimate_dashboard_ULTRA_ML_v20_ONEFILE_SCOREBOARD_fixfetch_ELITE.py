@@ -36,6 +36,7 @@ except ImportError as e:
     ELITE_FORECASTING_AVAILABLE = False
 
 import os
+import requests
 import json
 import sqlite3
 import importlib.util
