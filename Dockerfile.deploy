@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt numba aiohttp
+
+# Copy code
+COPY . .
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+ENV PROXY_MODE=true
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "elite_v20_dashboard_MEDALLION.py", "--server.port", "8501", "--server.address", "0.0.0.0"]

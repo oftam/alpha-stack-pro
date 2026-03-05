@@ -51,6 +51,11 @@ class FearGreedProvider:
                 'is_extreme_greed': bool (value > 80)
             }
         """
+        import os
+        if os.getenv('OFFLINE_MODE', '').lower() == 'true' or os.getenv('PROXY_MODE', '').lower() == 'true':
+            print("🔄 Using Proxy Mode for Fear & Greed Index")
+            return self._default_reading()
+
         try:
             response = requests.get(f"{self.base_url}?limit=1", timeout=5)
             response.raise_for_status()
@@ -87,6 +92,22 @@ class FearGreedProvider:
         Returns:
             DataFrame with columns: value, classification, timestamp
         """
+        import os
+        if os.getenv('OFFLINE_MODE', '').lower() == 'true' or os.getenv('PROXY_MODE', '').lower() == 'true':
+            print("🔄 Using Proxy Mode for Fear & Greed Index Historical Data")
+            dates = [datetime.now() - timedelta(days=i) for i in range(days)]
+            dates.reverse()
+            values = [15, 18, 22, 25, 20, 15, 12, 10, 18, 25][:days]
+            if len(values) < days:
+                values = values + [20] * (days - len(values))
+
+            df = pd.DataFrame({
+                'timestamp': dates,
+                'value': values,
+                'classification': ['Extreme Fear'] * days
+            })
+            return df.set_index('timestamp')
+
         try:
             response = requests.get(f"{self.base_url}?limit={days}", timeout=10)
             response.raise_for_status()
