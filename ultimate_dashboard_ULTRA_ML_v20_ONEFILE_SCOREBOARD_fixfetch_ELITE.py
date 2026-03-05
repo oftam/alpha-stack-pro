@@ -73,6 +73,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "scoreboard.sqlite")
 # Engine candidates (in same folder)
 ENGINE_CANDIDATES = [
     "quant_war_room_ml_pro_ONEFILE_v8b_spot_eventbias_QC_DIFF_CORR_TRUECVD.py",
+    "quant_war_room_ml_pro_ONEFILE_v8b_spot_eventbias_QC_DIFF_CORR_TRUECVD.py.bak",
     "quant_war_room_ml_pro_ONEFILE_v8_spot_eventbias_QC_DIFF_CORR_TRUECVD.py",
     "quant_war_room_ml_pro_ONEFILE_v7_spot_eventbias.py",
     "quant_war_room_ml_pro_ONEFILE_v6_spot_short_edu.py",
@@ -634,7 +635,7 @@ def main():
         resolved = 0
 
     # Tabs
-    tabs, tab_elite = st.tabs(["📈 Market", "🧠 Signal + Policy", "🫧 QC", "🧪 Projection", "📊 Scoreboard", "🎯 Elite Forecast", "⚙️ Raw"])
+    tabs = st.tabs(["📈 Market", "🧠 Signal + Policy", "🫧 QC", "🧪 Projection", "📊 Scoreboard", "🎯 Elite Forecast", "⚙️ Raw"])
 
     with tabs[0]:
         st.subheader("📈 Market")
@@ -741,153 +742,149 @@ def main():
         st.write("- RED: core_floor בלבד + Reduce ladder, עד שהמדדים חוזרים.")
 
     with tabs[5]:
+        st.subheader("🎯 Elite Ensemble Forecast")
+
+        if not ELITE_FORECASTING_AVAILABLE:
+            st.error("""
+            Elite forecasting not available.
+
+            Install:
+            ```bash
+            pip install arch statsmodels
+            ```
+
+            And ensure forecasting/ and integration/ folders are in the same directory as this dashboard.
+            """)
+        else:
+            # Configuration
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                forecast_horizon = st.number_input("Horizon (bars)", 24, 100, 48, step=12)
+
+            with col2:
+                n_paths = st.number_input("Paths", 100, 2000, 500, step=100)
+
+            with col3:
+                use_multiasset = st.checkbox("Multi-asset (VAR)", value=False)
+
+            # Initialize adapter (cache)
+            if 'elite_adapter' not in st.session_state:
+                st.session_state.elite_adapter = DashboardForecastAdapter(
+                    enable_garch=True,
+                    enable_var=True,
+                    enable_lstm=False  # Set True if you have trained model
+                )
+
+            adapter = st.session_state.elite_adapter
+
+            # Forecast button
+            if st.button("🚀 Run Ensemble Forecast"):
+                with st.spinner("Running ensemble (4 models)..."):
+                    try:
+                        # Fetch multi-asset data if requested
+                        multi_asset_dfs = None
+                        if use_multiasset:
+                            try:
+                                eth_df = _fetch_ohlcv_binance_rest('ETHUSDT', interval, min(1000, bars))
+                                sol_df = _fetch_ohlcv_binance_rest('SOLUSDT', interval, min(1000, bars))
+                                multi_asset_dfs = {
+                                    'ETH': eth_df,
+                                    'SOL': sol_df
+                                }
+                            except Exception as e:
+                                st.warning(f"Could not fetch multi-asset: {e}")
+
+                        # Get QC context if available
+                        qc_context = None
+                        if qc_payload:
+                            qc_context = qc_payload
+
+                        # Run forecast
+                        if multi_asset_dfs:
+                            forecast = adapter.forecast_advanced(
+                                df,
+                                multi_asset=multi_asset_dfs,
+                                qc_payload=qc_context,
+                                horizon=forecast_horizon,
+                                n_paths=n_paths
+                            )
+                        else:
+                            forecast = adapter.forecast_simple(
+                                df,
+                                horizon=forecast_horizon,
+                                n_paths=n_paths
+                            )
+
+                        # Store in session state
+                        st.session_state.elite_forecast = forecast
+                        st.success("✅ Forecast complete!")
+
+                    except Exception as e:
+                        st.error(f"Forecast failed: {e}")
+                        import traceback
+                        with st.expander("Error details"):
+                            st.code(traceback.format_exc())
+
+            # Display forecast if available
+            if 'elite_forecast' in st.session_state:
+                forecast = st.session_state.elite_forecast
+
+                # Render
+                adapter.render_in_streamlit(st, forecast, df, show_components=True)
+
+                # Additional stats
+                with st.expander("📊 Detailed Statistics"):
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.write("**24h Forecast Distribution:**")
+                        if forecast['horizon'] >= 24:
+                            st.write(f"- P10: ${forecast['p10'][24]:,.0f}")
+                            st.write(f"- P25: ${np.percentile(forecast['paths'][:, 24], 25):,.0f}")
+                            st.write(f"- P50: ${forecast['p50'][24]:,.0f}")
+                            st.write(f"- P75: ${np.percentile(forecast['paths'][:, 24], 75):,.0f}")
+                            st.write(f"- P90: ${forecast['p90'][24]:,.0f}")
+                            st.write(f"- Mean: ${np.mean(forecast['paths'][:, 24]):,.0f}")
+                            st.write(f"- Std: ${np.std(forecast['paths'][:, 24]):,.0f}")
+
+                    with col2:
+                        st.write("**Model Contributions:**")
+                        for model, weight in forecast.get('weights_used', {}).items():
+                            st.write(f"- {model}: {weight:.1%}")
+
+                        st.write(f"\n**Regime:** {forecast.get('regime', 'AUTO')}")
+                        st.write(f"**Horizon:** {forecast['horizon']} bars")
+
+                # Download forecast data
+                with st.expander("💾 Export Forecast Data"):
+                    # Create export DataFrame
+                    export_df = pd.DataFrame({
+                        'horizon': range(forecast['horizon'] + 1),
+                        'p10': forecast['p10'],
+                        'p50': forecast['p50'],
+                        'p90': forecast['p90'],
+                        'uncertainty': forecast['uncertainty']
+                    })
+
+                    csv = export_df.to_csv(index=False)
+                    st.download_button(
+                        label="Download CSV",
+                        data=csv,
+                        file_name=f"elite_forecast_{symbol}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv"
+                    )
+            else:
+                st.info("👆 Click 'Run Ensemble Forecast' to generate prediction")
+
+
+    with tabs[6]:
         st.subheader("⚙️ Raw")
         st.write("QC payload:", qc_payload)
         st.write("Last policy:", {"action": action, "policy_state": policy_state, "p_up": p_up, "ev": ev, "qc_codes": qc_codes, "drift_high": drift_high})
         st.write("Engine path:", ENGINE_PATH)
         st.write("DB path:", DB_PATH)
 
+
 if __name__ == "__main__":
     main()
-
-
-# ============================================================================
-# ELITE FORECAST TAB
-# ============================================================================
-
-with tab_elite:
-    st.subheader("🎯 Elite Ensemble Forecast")
-    
-    if not ELITE_FORECASTING_AVAILABLE:
-        st.error("""
-        Elite forecasting not available. 
-        
-        Install:
-        ```bash
-        pip install arch statsmodels
-        ```
-        
-        And ensure forecasting/ and integration/ folders are in the same directory as this dashboard.
-        """)
-    else:
-        # Configuration
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            forecast_horizon = st.number_input("Horizon (bars)", 24, 100, 48, step=12)
-        
-        with col2:
-            n_paths = st.number_input("Paths", 100, 2000, 500, step=100)
-        
-        with col3:
-            use_multiasset = st.checkbox("Multi-asset (VAR)", value=False)
-        
-        # Initialize adapter (cache)
-        if 'elite_adapter' not in st.session_state:
-            st.session_state.elite_adapter = DashboardForecastAdapter(
-                enable_garch=True,
-                enable_var=True,
-                enable_lstm=False  # Set True if you have trained model
-            )
-        
-        adapter = st.session_state.elite_adapter
-        
-        # Forecast button
-        if st.button("🚀 Run Ensemble Forecast"):
-            with st.spinner("Running ensemble (4 models)..."):
-                try:
-                    # Fetch multi-asset data if requested
-                    multi_asset_dfs = None
-                    if use_multiasset:
-                        try:
-                            eth_df = fetch_binance_klines('ETHUSDT', interval, min(1000, bars))
-                            sol_df = fetch_binance_klines('SOLUSDT', interval, min(1000, bars))
-                            multi_asset_dfs = {
-                                'ETH': eth_df,
-                                'SOL': sol_df
-                            }
-                        except Exception as e:
-                            st.warning(f"Could not fetch multi-asset: {e}")
-                    
-                    # Get QC context if available
-                    qc_context = None
-                    if decision and hasattr(decision, 'extra'):
-                        qc_context = decision.extra
-                    
-                    # Run forecast
-                    if multi_asset_dfs:
-                        forecast = adapter.forecast_advanced(
-                            df,
-                            multi_asset=multi_asset_dfs,
-                            qc_payload=qc_context,
-                            horizon=forecast_horizon,
-                            n_paths=n_paths
-                        )
-                    else:
-                        forecast = adapter.forecast_simple(
-                            df,
-                            horizon=forecast_horizon,
-                            n_paths=n_paths
-                        )
-                    
-                    # Store in session state
-                    st.session_state.elite_forecast = forecast
-                    st.success("✅ Forecast complete!")
-                    
-                except Exception as e:
-                    st.error(f"Forecast failed: {e}")
-                    import traceback
-                    with st.expander("Error details"):
-                        st.code(traceback.format_exc())
-        
-        # Display forecast if available
-        if 'elite_forecast' in st.session_state:
-            forecast = st.session_state.elite_forecast
-            
-            # Render
-            adapter.render_in_streamlit(st, forecast, df, show_components=True)
-            
-            # Additional stats
-            with st.expander("📊 Detailed Statistics"):
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.write("**24h Forecast Distribution:**")
-                    if forecast['horizon'] >= 24:
-                        st.write(f"- P10: ${forecast['p10'][24]:,.0f}")
-                        st.write(f"- P25: ${np.percentile(forecast['paths'][:, 24], 25):,.0f}")
-                        st.write(f"- P50: ${forecast['p50'][24]:,.0f}")
-                        st.write(f"- P75: ${np.percentile(forecast['paths'][:, 24], 75):,.0f}")
-                        st.write(f"- P90: ${forecast['p90'][24]:,.0f}")
-                        st.write(f"- Mean: ${np.mean(forecast['paths'][:, 24]):,.0f}")
-                        st.write(f"- Std: ${np.std(forecast['paths'][:, 24]):,.0f}")
-                
-                with col2:
-                    st.write("**Model Contributions:**")
-                    for model, weight in forecast.get('weights_used', {}).items():
-                        st.write(f"- {model}: {weight:.1%}")
-                    
-                    st.write(f"\n**Regime:** {forecast.get('regime', 'AUTO')}")
-                    st.write(f"**Horizon:** {forecast['horizon']} bars")
-            
-            # Download forecast data
-            with st.expander("💾 Export Forecast Data"):
-                # Create export DataFrame
-                export_df = pd.DataFrame({
-                    'horizon': range(forecast['horizon'] + 1),
-                    'p10': forecast['p10'],
-                    'p50': forecast['p50'],
-                    'p90': forecast['p90'],
-                    'uncertainty': forecast['uncertainty']
-                })
-                
-                csv = export_df.to_csv(index=False)
-                st.download_button(
-                    label="Download CSV",
-                    data=csv,
-                    file_name=f"elite_forecast_{symbol}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.csv",
-                    mime="text/csv"
-                )
-        else:
-            st.info("👆 Click 'Run Ensemble Forecast' to generate prediction")
-
