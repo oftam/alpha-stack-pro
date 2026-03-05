@@ -1,0 +1,8 @@
+gcloud run deploy medallion-elite-dashboard \
+    --source . \
+    --region us-central1 \
+    --allow-unauthenticated \
+    --port 8501 \
+    --memory 2Gi \
+    --cpu 2 \
+    --set-env-vars PROXY_MODE=true

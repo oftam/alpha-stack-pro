@@ -15,6 +15,43 @@ import pandas as pd
 from typing import Dict, Optional, List
 from dataclasses import dataclass
 from enum import Enum
+import numba
+
+@numba.jit(nopython=True, fastmath=True, cache=True)
+def _numba_calculate_true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
+    n = len(close)
+    tr = np.zeros(n)
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        hl = high[i] - low[i]
+        hc = abs(high[i] - close[i-1])
+        lc = abs(low[i] - close[i-1])
+        tr[i] = max(hl, hc, lc)
+    return tr
+
+@numba.jit(nopython=True, fastmath=True, cache=True)
+def _numba_calculate_violence_components(tr: np.ndarray, close: np.ndarray, lookback: int) -> tuple:
+    n = len(close)
+    if n < 20:
+        return 0.0, 0.0, False
+
+    recent_tr_mean = np.mean(tr[-5:])
+    long_term_tr_mean = np.mean(tr[-lookback:])
+    vol_clustering = recent_tr_mean > long_term_tr_mean * 1.5
+
+    returns = np.zeros(20)
+    for i in range(20):
+        idx = n - 20 + i
+        # Prevent wrapping around to the end of the array if idx == 0
+        if idx > 0 and close[idx-1] > 0:
+            returns[i] = (close[idx] - close[idx-1]) / close[idx-1]
+
+    volatility = np.std(returns) * 100
+    atr = np.mean(tr[-14:])
+    price = close[-1]
+    atr_ratio = (atr / price) * 100 if price > 0 else 0.0
+
+    return atr_ratio, volatility, vol_clustering
 
 
 class Regime(Enum):
@@ -55,15 +92,16 @@ class ViolenceChaosDetector:
         
         TR = max(high - low, |high - prev_close|, |low - prev_close|)
         """
-        if df.empty or 'high' not in df.columns:
+        if df.empty or 'high' not in df.columns or 'low' not in df.columns or 'close' not in df.columns:
             return pd.Series(dtype=float)
         
-        high_low = df['high'] - df['low']
-        high_close = abs(df['high'] - df['close'].shift(1))
-        low_close = abs(df['low'] - df['close'].shift(1))
-        
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        return tr
+        # Use numba for fast execution
+        tr_array = _numba_calculate_true_range(
+            df['high'].values.astype(np.float64),
+            df['low'].values.astype(np.float64),
+            df['close'].values.astype(np.float64)
+        )
+        return pd.Series(tr_array, index=df.index)
     
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
         """Average True Range"""
@@ -99,20 +137,23 @@ class ViolenceChaosDetector:
         - Volatility clustering
         - Recent price swings
         """
-        if df.empty or len(df) < 20:
+        if df.empty or len(df) < 20 or 'high' not in df.columns or 'low' not in df.columns or 'close' not in df.columns:
             return 50.0
+
+        # Use numba components to speed up
+        tr_array = _numba_calculate_true_range(
+            df['high'].values.astype(np.float64),
+            df['low'].values.astype(np.float64),
+            df['close'].values.astype(np.float64)
+        )
         
-        # ATR ratio
-        atr = self.calculate_atr(df)
-        price = df['close'].iloc[-1]
-        atr_ratio = (atr / price) * 100 if price > 0 else 0
-        
-        # Recent swings (std of returns)
-        returns = df['close'].pct_change().tail(20)
-        volatility = returns.std() * 100
+        atr_ratio, volatility, is_clustered = _numba_calculate_violence_components(
+            tr_array,
+            df['close'].values.astype(np.float64),
+            self.lookback
+        )
         
         # Clustering bonus
-        is_clustered = self.detect_volatility_clustering(df)
         clustering_bonus = 20 if is_clustered else 0
         
         # Combine (normalize to 0-100)
